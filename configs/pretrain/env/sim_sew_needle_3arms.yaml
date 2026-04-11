@@ -1,0 +1,17 @@
+# @package _global_
+
+dataset_repo_id: iantc104/gv_sim_sew_needle_3arms
+fps: 25
+
+eval:
+  # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
+  # set it to false to avoid some problems of the aloha env
+  use_async_envs: false
+
+env:
+  name: guided_vision
+  task: SewNeedle-3Arms-v0
+  state_dim: 21
+  action_dim: 21
+  fps: ${fps}
+  episode_length: 300
