@@ -17,7 +17,7 @@ from env.constants import (
     LEFT_GRIPPER_JOINT_NAMES, RIGHT_GRIPPER_JOINT_NAMES
 )
 
-CAMERAS = ['zed_cam_left', 'zed_cam_right', 'cam_left_wrist', 'cam_right_wrist', 'cam_high', 'cam_low']
+CAMERAS = ['zed_cam_left', 'zed_cam_right', 'wrist_cam_left', 'wrist_cam_right', 'overhead_cam', 'worms_eye_cam']
 
 class GuidedVisionEnv(gym.Env):
 
@@ -178,14 +178,15 @@ class GuidedVisionEnv(gym.Env):
 
         return observation, reward, terminated, truncated, info
 
-    def render(self):
+    def render(self,render_camera):
         """
         Gymnasium 标准渲染接口，供 LeRobot 等高级框架录制视频时调用。
         必须返回 (H, W, C) 维度的 numpy 图像矩阵。
         """
         # 选择一个最好的相机视角用来生成测试录像（比如用左目相机）
         # 这里默认使用 self.cameras 列表里的第一个相机
-        render_cam = self.cameras[0] if len(self.cameras) > 0 else 'zed_cam_left'
+        # render_cam = self.cameras[0] if len(self.cameras) > 0 else 'zed_cam_left'
+        render_cam = render_camera[0] if len(render_camera) > 0 else 'overhead_cam'
         
         try:
             # MuJoCo 的 render 默认输出的就是标准的 (H, W, C) rgb_array
@@ -269,29 +270,29 @@ class SewNeedleEnv(GuidedVisionEnv):
 
         for geom1, geom2 in contact_pairs:
             if geom1 == "needle" and geom2.startswith("right"):
-                touch_right_gripper = True
+                touch_right_gripper = True    # 右手碰到了针
             if geom1 == "needle" and geom2.startswith("left"):
-                touch_left_gripper = True
+                touch_left_gripper = True     # 左手碰到了针
             if geom1 == "table" and geom2 == "needle":
-                needle_touch_table = True
+                needle_touch_table = True     # 针接触到桌面
             if geom1 == "needle" and geom2.startswith("wall-"):
-                needle_touch_wall = True
+                needle_touch_wall = True      # 针接触到墙
             if geom1 == "pin-needle" and geom2 == "pin-wall":
-                self._threaded_needle = True
+                self._threaded_needle = True  # 针穿过墙
             if geom1 == "needle" and geom2 == "pin-wall":
-                needle_touch_pin = True
+                needle_touch_pin = True       # 针接触到墙
 
         # 塑造奖励 (Reward Shaping)
         reward = 0
-        if touch_right_gripper: 
+        if touch_right_gripper:                                 # 右臂碰到了针
             reward = 1
-        if touch_right_gripper and (not needle_touch_table): 
+        if touch_right_gripper and (not needle_touch_table):    # 右臂成功抓起了针
             reward = 2
-        if needle_touch_wall and (not needle_touch_table): 
+        if needle_touch_wall and (not needle_touch_table):      # 针接触到墙壁，且未掉落
             reward = 3
-        if self._threaded_needle: 
+        if self._threaded_needle:                               # 穿针成功
             reward = 4
-        if touch_left_gripper and (not touch_right_gripper) and (not needle_touch_table) and (not needle_touch_pin) and self._threaded_needle: 
+        if touch_left_gripper and (not touch_right_gripper) and (not needle_touch_table) and (not needle_touch_pin) and self._threaded_needle: # 完美穿针并成功换手交接
             reward = 5
             
         return reward

@@ -1,0 +1,13 @@
+# 路径: configs/train_dppo.yaml
+
+# 🌟 核心：告诉 Hydra 去哪里拉取基础配置
+defaults:
+  - policy: ft_zed_diffusion   
+  - _self_                      # 允许本文件覆盖上面的默认值
+
+hydra:
+  run:
+    dir: outputs/finetune/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.name}_${policy.name}_${hydra.job.name}
+    # dir: src/av-aloha/DPPO/outputs/pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.name}_${policy.name}_${hydra.job.name}
+  job:
+    name: default

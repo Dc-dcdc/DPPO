@@ -22,7 +22,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     max_rendered = getattr(cfg_eval, "max_episodes_rendered", 4)
     fps = getattr(cfg_eval, "fps", 25)
     max_steps = getattr(cfg_eval, "max_steps", 300)
-    
+    render_camera = getattr(cfg_eval, "render_camera", 'overhead_cam')
     # 动作执行循环
     for ep in range(n_episodes):
         obs, _ = env.reset()
@@ -36,7 +36,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
         for step in range(max_steps):
             # 1. 如果还在需要渲染的额度内，才调用渲染 (提升非渲染 episode 的评估速度)
             if ep < max_rendered:
-                frames.append(env.render())
+                frames.append(env.render(render_camera))
 
             # 2. 手动处理格式，将 Numpy 字典转为 Tensor 字典送入模型
             batch = {}
@@ -52,6 +52,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
 
             # 3. 推理获取动作
             with torch.no_grad():
+                # 使用lerobot自带的推理函数
                 action = policy.select_action(batch)
             
             # 4. 把模型输出的 Tensor 动作转回 Numpy
@@ -71,7 +72,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
 
         # 6. 根据配置的帧率和最大渲染数量保存视频
         if ep < max_rendered and len(frames) > 0:
-            video_path = videos_dir / f"eval_ep_{ep}.mp4"
+            video_path = videos_dir / f"eval_{render_camera[0]}_{ep}.mp4"
             imageio.mimsave(str(video_path), frames, fps=fps)
             logging.info(f"🎥 保存视频: {video_path}")
 
@@ -84,7 +85,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
             "success_rate": float(np.mean(successes)),
             "average_reward": float(np.mean(rewards))
         },
-        "video_paths": [str(videos_dir / f"eval_ep_{i}.mp4") for i in range(actual_rendered)]
+        "video_paths": [str(videos_dir / f"eval_{render_camera[0]}_{i}.mp4") for i in range(actual_rendered)]
     }
 
 
@@ -128,3 +129,104 @@ def evaluate_and_checkpoint_if_needed(
     if getattr(cfg.training, "save_checkpoint", False) and (step > 0 and step % save_freq == 0 or is_last_step):
         logging.info(f"💾 保存模型快照... Step: {step}")
         logger.save_checkpoint(step, policy, optimizer, lr_scheduler, identifier=step_identifier)
+
+
+# ==========================================
+# 🌟 纯净版独立测试入口 (Standalone Evaluation - No Hydra)
+# ==========================================
+if __name__ == "__main__":
+    import os
+    import sys
+    import torch
+    from types import SimpleNamespace
+    from contextlib import nullcontext
+    from lerobot.common.policies.factory import make_policy
+    from lerobot.common.utils.utils import get_safe_torch_device
+    
+    # 确保能够导入你的环境
+    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+    from env.sim_envs import SewNeedleEnv
+
+    # ==========================================
+    # 🎯 核心配置区：在这里自由修改你的评估参数！
+    # ==========================================
+    eval_cfg = SimpleNamespace(
+        # 📂 模型路径设置 (直接指向 000000 这样的数字文件夹即可，代码会自动寻找内部结构)
+        ckpt_path="outputs/pretrain/train/2026-04-11/20-27-32_guided_vision_diffusion_default/checkpoints/009999",
+        
+        # ⚙️ 评估参数设置
+        n_episodes=4,             # 评估多少个任务                 
+        max_episodes_rendered=4,  # 保存多少个视频 
+        fps=25,                   # 视频帧率，和环境控制频率对齐
+        max_steps=400,            # 每个任务的最大步数
+        
+        # 📷 相机设置
+        reference_cameras=['zed_cam_left', 'zed_cam_right'], 
+        render_camera=['overhead_cam']         # 保存video的相机视角              
+    )
+    USE_AMP = True  
+    # ==========================================
+
+    def main():
+        ckpt_path = eval_cfg.ckpt_path
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"❌ 找不到权重路径: {ckpt_path}\n请检查路径是否正确。")
+
+        # 🌟 核心修改：自动探测 LeRobot 的 pretrained_model 子文件夹
+        hf_model_dir = os.path.join(ckpt_path, "pretrained_model")
+        if os.path.exists(hf_model_dir):
+            print(f"🔍 检测到 LeRobot 标准快照结构，将自动读取子目录: pretrained_model")
+            load_dir = hf_model_dir
+        else:
+            load_dir = ckpt_path # 兼容其他保存格式
+
+        # 准备设备 (传入 "cuda" 防止新版本报错)
+        device = get_safe_torch_device("cuda")
+        print(f"🚀 初始化评估程序... 使用设备: {device}")
+
+        # 动态合并相机列表并初始化环境
+        all_cams = list(dict.fromkeys(eval_cfg.reference_cameras + eval_cfg.render_camera))
+        print(f"📷 正在初始化环境，加载相机: {all_cams}")
+        env = SewNeedleEnv(cameras=all_cams)
+
+        # 实例化 Policy 并加载权重
+        print(f"💾 正在从目录重建网络并加载权重: {load_dir}")
+        try:
+            # ==========================================
+            # 🌟 直接使用 DiffusionPolicy 官方类，绕开所有版本不兼容的 API
+            # ==========================================
+            from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
+            
+            # 像加载常规 Hugging Face 模型一样，直接读取文件夹
+            policy = DiffusionPolicy.from_pretrained(load_dir)
+            
+            # 手动推入 GPU
+            policy.to(device)
+        except Exception as e:
+            raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
+
+        # 设置视频输出目录 (默认在 000000 文件夹同级新建 eval_videos 文件夹)
+        videos_dir = os.path.join(ckpt_path, "eval_videos")
+        print(f"🎬 开始测试! 录像将保存在: {videos_dir}")
+
+        # 调用透明评估函数
+        with torch.autocast(device_type=device.type) if USE_AMP else nullcontext():
+            eval_info = custom_eval_policy(
+                env=env,
+                policy=policy,
+                cfg_eval=eval_cfg,     
+                videos_dir=videos_dir,
+                device=device
+            )
+
+        # 打印最终结果
+        sr = eval_info["aggregated"]["success_rate"]
+        ar = eval_info["aggregated"]["average_reward"]
+        print("\n" + "="*50)
+        print(f"🎉 独立评估完成！")
+        print(f"🏆 成功率 (Success Rate): {sr*100:.1f}%")
+        print(f"💰 平均奖励 (Average Reward): {ar:.2f}")
+        print("="*50)
+
+    # 启动
+    main()

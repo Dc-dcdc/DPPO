@@ -455,17 +455,9 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # ==========================================
     # 🌟 5. 初始化评估环境
     # ==========================================
-    # 5.1 初始化原始物理引擎环境
-    # eval 的时候，强制要求渲染图像 (rgb_array) 这样 eval_policy 才能录制视频
-    # eval_env = SewNeedleEnv(cfg.eval.cameras)
-    eval_env = SewNeedleEnv(cameras=['zed_cam_left', 'zed_cam_right'])
-
-    # # 5.2 套上数据对齐 Wrapper
-    # # 这里的 normalization_path 应该是你提取预训练数据时存的 min/max 或 mean/std
-    # # 这样模型输出的 [-1, 1] 才能被还原为实际机械臂关节角度
-    # eval_env = SewNeedleWrapper(
-    #     raw_eval_env, 
-    #     normalization_path="path/to/your/dataset/normalization.npz"
+    # 观测要用的相机列表  =  模型推理要用的相机列表 + 评估时保存的video视角相机
+    obs_cameras= list(dict.fromkeys(cfg.eval.reference_cameras + cfg.eval.render_camera)) 
+    eval_env = SewNeedleEnv(cameras=obs_cameras)
     
     # ==========================================
     # 🌟 6. DPPO 预训练主循环
@@ -519,7 +511,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
 # ==========================================
 # 🌟 Hydra 启动入口 (保留配置功能与 Args 注入)
 # ==========================================
-@hydra.main(version_base="1.2", config_name="default", config_path="../configs/pretrain")
+@hydra.main(version_base="1.2", config_name="pre_default", config_path="../configs/pretrain") #配置文件存放位置
 def train_cli(cfg: DictConfig):          
     train_dppo_pretrain(
         cfg,
@@ -531,12 +523,11 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
-        "env=sim_sew_needle_3arms",
-        "policy=zed_diffution", 
-        "resume=false",
-        "resume_path=src/av-aloha/DPPO/outputs/pretrain/train/2026-04-09/11-37-27_guided_vision_diffusion_default/checkpoints/000500",
+        "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
+        "policy=pre_zed_diffusion", # 策略
+        "resume=true",
+        "resume_path=outputs/pretrain/train/2026-04-13/10-09-32_guided_vision_diffusion_default/checkpoints/010000",
         "training.batch_size=16",
-        "training.offline_steps=10000",
         "training.num_workers=4",
         "wandb.enable=false" ,
     ]
