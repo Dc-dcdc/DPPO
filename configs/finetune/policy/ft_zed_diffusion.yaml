@@ -1,16 +1,27 @@
-# configs/finetune/dppo_finetune.yaml
+# @package _global_
+# 使用@package _global_让policy文件的内容提升到和default文件目录以进行合并
+# 可以使用命令行python finetune/train_finetune.py --cfg job进行查看
+
 # 🌟 DPPO 微调专属配置
 project_name: "dppo_finetune_sew_needle"
+
+env:
+  name : "sim_sew_needle_3arms"
+  reference_cameras : ['zed_cam_left', 'zed_cam_right']      # 模型推理要用的相机图像（条件输入）
+  render_camera : ['overhead_cam']                           # 评估时保存的video视角相机
+
+ft_denoising_steps: 10  # ddim去噪步数和ddpm实际记录的去噪步数（即记录最后的几条）
+n_envs: 1               # 并行环境数量
 
 training:
   # 预训练权重的绝对路径 (用来初始化 Actor)
   pretrained_ckpt_path: "outputs/pretrain/train/2026-04-13/11-21-21_guided_vision_diffusion_default/checkpoints/050000"
   
   # RL 训练步数与频率
-  total_rl_steps: 10000        # 微调通常不需要跑太久
-  rollout_length: 300          # 每次收集多少步数据再去更新
-  ppo_epochs: 4                # 收集完数据后，在这些数据上更新几轮网络
-  batch_size: 64               # PPO 更新的 batch size
+  n_train_itr: 10000          # 总迭代轮数，微调通常不需要跑太久
+  rollout_steps: 300          # 每次收集多少步数据再去更新
+  update_epochs: 4            # 收集完数据后，在这些数据上更新几轮网络
+  batch_size: 16              # PPO 更新的 batch size
   
   # 学习率 (微调时一定要极小，防止破坏预训练特征！)
   actor_lr: 1e-5               # Diffusion 网络的学习率
@@ -28,3 +39,64 @@ eval:
   fps: 25
   reference_cameras: ['zed_cam_left', 'zed_cam_right']
   render_camera: ['overhead_cam']
+
+policy:
+  name: diffusion
+  # ==========================================
+  # 1. 形状与时序 (Shape & Temporal)
+  # ==========================================
+  n_obs_steps: 2 # 2帧历史画面
+  horizon : 16 # 推理总步数   一个horizon视为一个动作块
+  n_action_steps: 8 # 执行的实际步数
+
+  input_shapes:
+    # TODO(rcadene, alexander-soare): add variables for height and width from the dataset/env?
+    observation.images.zed_cam_left: [3, 480, 640]
+    observation.images.zed_cam_right: [3, 480, 640]
+    observation.state: ["${env.state_dim}"]
+  output_shapes:
+    action: ["${env.action_dim}"]
+
+  # Normalization / Unnormalization
+  input_normalization_modes:
+    observation.images.zed_cam_left: mean_std
+    observation.images.zed_cam_right: mean_std
+    observation.state: mean_std
+  output_normalization_modes:
+    action: mean_std
+
+  # ==========================================
+  # 2. 视觉特征提取 (Vision Backbone)
+  # ==========================================
+  vision_backbone: resnet18
+  # pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1 #预训练的视觉编码器模型，一般来说会设置较小的lr_backbone进行微调，这里不设置，直接使用和unet一样的学习率
+  use_group_norm: true                # 【新增】配合 Diffusion
+  spatial_softmax_num_keypoints: 32   # 【新增】提取图片关键点，替代 ACT 的特征平铺
+
+  # ==========================================
+  # 3. U-Net 降噪网络架构 (U-Net Architecture)
+  # ==========================================
+  down_dims: [256, 512, 1024]   #[512, 1024, 2048] 
+  kernel_size: 5
+  n_groups: 8
+  diffusion_step_embed_dim: 128
+  use_film_scale_modulation: true     # 【关键】将状态特征通过 FiLM 层注入 U-Net
+
+  # ==========================================
+  # 4. 噪声调度器 (Noise Scheduler)
+  # ==========================================
+  noise_scheduler_type: DDIM          # 噪声调度器
+  num_inference_steps: 10             # 去噪步数
+  num_train_timesteps: 100            # 训练时的总加噪步数
+  beta_schedule: squaredcos_cap_v2    # 建议的 beta 调度策略
+  beta_start: 0.0001
+  beta_end: 0.02
+  prediction_type: epsilon            # 预测目标：噪声 (epsilon)
+  clip_sample: true
+  clip_sample_range: 1.0
+
+  # ==========================================
+  # 5. 推理与 EMA (Inference & EMA)
+  # ==========================================
+  use_ema: true                       # 【关键】必须开启,降低精度提升推理速度
+  ema_decay: 0.9999                   # 【关键】EMA 的衰减系数

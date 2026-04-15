@@ -2,20 +2,20 @@ defaults:
   - _self_
   # 默认加载的环境和策略
   - env: sim_sew_needle_3arms
-  - policy: zed_act
+  - policy: pre_zed_diffusion
 
 hydra:
   run:
     dir: outputs/pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.name}_${policy.name}_${hydra.job.name}
     # dir: src/av-aloha/DPPO/outputs/pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.name}_${policy.name}_${hydra.job.name}
   job:
-    name: default
+    name: pretrain_zed_diffusion_${now:%Y-%m-%d}_${now:%H-%M-%S}
 
 # 将 `resume` 设置为 true 以恢复之前的运行。为此，您需要确保hydra.run.dir是至少包含一个检查点的现有运行目录。
 # 注意，当恢复运行时，默认行为是使用检查点中的配置，无论恢复时训练命令提供了什么参数。。
 resume: false
 resume_path: none
-device: cuda  # cuda或cpu
+device: "cuda:0"  # cuda或cpu
 
 # 把部分计算从 float32 改成 float16，速度快 30%~100%
 use_amp: True

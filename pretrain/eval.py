@@ -4,7 +4,9 @@ import numpy as np
 import imageio
 from pathlib import Path
 from contextlib import nullcontext
-
+import gymnasium as gym
+import yaml
+from pathlib import Path
 def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     """
     完全自主实现的评估代码。没有任何黑盒。
@@ -36,7 +38,8 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
         for step in range(max_steps):
             # 1. 如果还在需要渲染的额度内，才调用渲染 (提升非渲染 episode 的评估速度)
             if ep < max_rendered:
-                frames.append(env.render(render_camera))
+                frames.append(env.unwrapped.render(render_camera)) # gym创建需要加上 .unwrapped
+                # frames.append(env.render(render_camera))  #直接创建环境不需要
 
             # 2. 手动处理格式，将 Numpy 字典转为 Tensor 字典送入模型
             batch = {}
@@ -131,9 +134,9 @@ def evaluate_and_checkpoint_if_needed(
         logger.save_checkpoint(step, policy, optimizer, lr_scheduler, identifier=step_identifier)
 
 
-# ==========================================
-# 🌟 纯净版独立测试入口 (Standalone Evaluation - No Hydra)
-# ==========================================
+# =========================================================================
+# 🌟 独立评估测试入口，推荐使用lerobot保存的快照格式，只需要给路径，环境配置会自动对齐
+# =========================================================================
 if __name__ == "__main__":
     import os
     import sys
@@ -152,8 +155,9 @@ if __name__ == "__main__":
     # ==========================================
     eval_cfg = SimpleNamespace(
         # 📂 模型路径设置 (直接指向 000000 这样的数字文件夹即可，代码会自动寻找内部结构)
-        ckpt_path="outputs/pretrain/train/2026-04-11/20-27-32_guided_vision_diffusion_default/checkpoints/009999",
-        
+        ckpt_path="outputs/pretrain/train/2026-04-15/12-42-37_sim_envs_diffusion_pretrain_zed_diffusion_2026-04-15_12-42-37/checkpoints/040000",
+        name = 'sim_envs', #会自动加载，可以不改
+        task = 'SewNeedle-3Arms-v0', #会自动加载，可以不改
         # ⚙️ 评估参数设置
         n_episodes=4,             # 评估多少个任务                 
         max_episodes_rendered=4,  # 保存多少个视频 
@@ -161,7 +165,6 @@ if __name__ == "__main__":
         max_steps=400,            # 每个任务的最大步数
         
         # 📷 相机设置
-        reference_cameras=['zed_cam_left', 'zed_cam_right'], 
         render_camera=['overhead_cam']         # 保存video的相机视角              
     )
     USE_AMP = True  
@@ -171,8 +174,9 @@ if __name__ == "__main__":
         ckpt_path = eval_cfg.ckpt_path
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"❌ 找不到权重路径: {ckpt_path}\n请检查路径是否正确。")
-
-        # 🌟 核心修改：自动探测 LeRobot 的 pretrained_model 子文件夹
+        # ==========================================
+        # 🌟 1.自动探测 LeRobot 的 pretrained_model 子文件夹
+        # ==========================================
         hf_model_dir = os.path.join(ckpt_path, "pretrained_model")
         if os.path.exists(hf_model_dir):
             print(f"🔍 检测到 LeRobot 标准快照结构，将自动读取子目录: pretrained_model")
@@ -184,17 +188,13 @@ if __name__ == "__main__":
         device = get_safe_torch_device("cuda")
         print(f"🚀 初始化评估程序... 使用设备: {device}")
 
-        # 动态合并相机列表并初始化环境
-        all_cams = list(dict.fromkeys(eval_cfg.reference_cameras + eval_cfg.render_camera))
-        print(f"📷 正在初始化环境，加载相机: {all_cams}")
-        env = SewNeedleEnv(cameras=all_cams)
-
-        # 实例化 Policy 并加载权重
+        
+        # ==========================================
+        # 🌟 2.实例化 Policy 并加载权重
+        # ==========================================
         print(f"💾 正在从目录重建网络并加载权重: {load_dir}")
         try:
-            # ==========================================
-            # 🌟 直接使用 DiffusionPolicy 官方类，绕开所有版本不兼容的 API
-            # ==========================================
+            #  直接使用 DiffusionPolicy 官方类，绕开所有版本不兼容的 API
             from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
             
             # 像加载常规 Hugging Face 模型一样，直接读取文件夹
@@ -204,22 +204,65 @@ if __name__ == "__main__":
             policy.to(device)
         except Exception as e:
             raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
+        
+        # ==========================================
+        # 🌟 3.读取快照中的配置，使环境和训练时的对齐
+        # ==========================================
+        all_obs_keys = policy.config.input_shapes.keys()
+        ref_cams = [k.replace("observation.images.", "") for k in all_obs_keys if "observation.images." in k]
+        if not ref_cams:
+            raise ValueError(f"❌ 严重冲突：模型中未找到相机相关参数。请检查模型输入是否正确。")
+        obs_cameras = list(dict.fromkeys(ref_cams + eval_cfg.render_camera))
+        # 动态读取环境元数据 (直接从 load_dir 读取)
+        
+        config_yaml_path = Path(load_dir) / "config.yaml"
 
-        # 设置视频输出目录 (默认在 000000 文件夹同级新建 eval_videos 文件夹)
+        if config_yaml_path.exists():
+            with open(config_yaml_path, "r") as f:
+                full_cfg = yaml.safe_load(f)
+                
+                # 安全地从 YAML 的字典树中提取 env.name 和 env.task
+                env_cfg = full_cfg.get("env", {})
+                env_name = env_cfg.get("name", getattr(env_cfg, "name", "sim_envs"))
+                env_task = env_cfg.get("task", getattr(env_cfg, "task", "SewNeedle-3Arms-v0"))
+                logging.info(f"📦 成功从预训练文件夹读取完整环境配置: {env_name}/{env_task}")
+        else:
+            # 极限防呆后备
+            env_name = getattr(eval_cfg, "name", "sim_envs")
+            env_task = getattr(eval_cfg, "task", "SewNeedle-3Arms-v0")
+            logging.warning(f"⚠️ 未找到 config.yaml，使用本地设定的后备环境: {env_name}/{env_task}")
+
+        # 拼接 Gym ID
+        env_id = f"{env_name}/{env_task}"
+        logging.info(f"正在通过 Gym 注册表构建环境: {env_id}")
+        # 使用 gym.make 创建环境，并通过 kwargs 强行覆盖你需要的相机
+        eval_env = gym.make(
+            id=env_id, 
+            cameras=obs_cameras  # 👈 这里的传参会直接覆盖 __init__.py 里的默认套餐！
+        )
+        logging.info(f"✅ 环境加载成功！最终挂载的相机: {obs_cameras}")
+
+        # ==========================================
+        # 🌟 4.设置视频输出目录 (默认在 000000 文件夹同级新建 eval_videos 文件夹)
+        # ==========================================
         videos_dir = os.path.join(ckpt_path, "eval_videos")
         print(f"🎬 开始测试! 录像将保存在: {videos_dir}")
 
-        # 调用透明评估函数
+        # ==========================================
+        # 🌟 5.调用评估函数
+        # ==========================================
         with torch.autocast(device_type=device.type) if USE_AMP else nullcontext():
             eval_info = custom_eval_policy(
-                env=env,
+                env=eval_env,
                 policy=policy,
                 cfg_eval=eval_cfg,     
                 videos_dir=videos_dir,
                 device=device
             )
 
-        # 打印最终结果
+        # ==========================================
+        # 🌟 6.打印最终结果
+        # ==========================================
         sr = eval_info["aggregated"]["success_rate"]
         ar = eval_info["aggregated"]["average_reward"]
         print("\n" + "="*50)

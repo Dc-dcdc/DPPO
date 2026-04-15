@@ -2,8 +2,11 @@
 
 # 🌟 核心：告诉 Hydra 去哪里拉取基础配置
 defaults:
-  - policy: ft_zed_diffusion   
   - _self_                      # 允许本文件覆盖上面的默认值
+  - policy: ft_zed_diffusion   
+
+
+device: "cuda:0"  # cuda或cpu
 
 hydra:
   run:
@@ -11,3 +14,15 @@ hydra:
     # dir: src/av-aloha/DPPO/outputs/pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.name}_${policy.name}_${hydra.job.name}
   job:
     name: default
+
+training:
+  pretrained_ckpt_path: "outputs/pretrain/train/2026-04-13/11-21-21_guided_vision_diffusion_default/checkpoints/050000"
+  rollout_steps: 500
+
+
+wandb:
+  enable: true
+  # Set to true to disable saving an artifact despite save_checkpoint == True
+  disable_artifact: false
+  project: lerobot
+  notes: ""

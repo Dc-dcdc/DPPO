@@ -2,6 +2,8 @@
 # import os
 # os.environ["HF_ENDPOINT"] = "https://hf-mirror.com" # 强行指向国内镜像站
 import gymnasium as gym
+import env
+from env.sim_envs import SewNeedleEnv 
 import logging
 import time
 import sys
@@ -9,7 +11,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from pprint import pformat
 from itertools import cycle  # 🌟 使用 Python 原生的循环迭代器，更轻量
-from env.sim_envs import SewNeedleEnv 
+
 from eval import  evaluate_and_checkpoint_if_needed
 
 import hydra
@@ -308,6 +310,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     DPPO 第一阶段：基于专家数据的 Diffusion 策略预训练 (Offline Behavior Cloning)
     结合了 Hydra 配置管理与 LeRobot 最新极简数据加载 API。
     """
+    
     init_logging() #初始化日志
     logging.info(pformat(OmegaConf.to_container(cfg))) #打印配置cfg
 
@@ -453,12 +456,28 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     logging.info(f"🎯 预训练目标步数: {cfg.training.offline_steps}")
 
     # ==========================================
-    # 🌟 5. 初始化评估环境
+    # 🌟 5. 动态拼接环境 ID 并创建环境
     # ==========================================
     # 观测要用的相机列表  =  模型推理要用的相机列表 + 评估时保存的video视角相机
-    obs_cameras= list(dict.fromkeys(cfg.eval.reference_cameras + cfg.eval.render_camera)) 
-    eval_env = SewNeedleEnv(cameras=obs_cameras)
+    all_obs_keys = policy.config.input_shapes.keys()
+    ref_cams = [k.replace("observation.images.", "") for k in all_obs_keys if "observation.images." in k]
+    if not ref_cams:
+        raise ValueError(f"❌ 严重冲突：模型中未找到相机相关参数。请检查模型输入是否正确。")
+    obs_cameras = list(dict.fromkeys(ref_cams + cfg.eval.render_camera))
+
+    # 读取 YAML 中的 name ("sim_envs") 和 task ("SewNeedle-2Arms-v0")
+    # 拼接出 "sim_envs/SewNeedle-2Arms-v0"
+    env_id = f"{cfg.env.name}/{cfg.env.task}" 
     
+    logging.info(f"正在通过 Gym 注册表构建环境: {env_id}")
+    
+    # 使用 gym.make 创建环境，并通过 kwargs 强行覆盖你需要的相机
+    eval_env = gym.make(
+        id=env_id, 
+        cameras=obs_cameras  # 👈 这里的传参会直接覆盖 __init__.py 里的默认套餐！
+    )
+    logging.info(f"✅ 环境加载成功！最终挂载的相机: {obs_cameras}")
+
     # ==========================================
     # 🌟 6. DPPO 预训练主循环
     # ==========================================
@@ -523,13 +542,13 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
-        "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
-        "policy=pre_zed_diffusion", # 策略
-        "resume=true",
-        "resume_path=outputs/pretrain/train/2026-04-13/10-09-32_guided_vision_diffusion_default/checkpoints/010000",
+        "env=sim_sew_needle_2arms", # 环境，这俩定义在default文件中
+        "policy=pre_static_wrist_diffusion", # 策略
+        "resume=false",
+        "resume_path=outputs/pretrain/train/2026-04-14/20-59-47_guided_vision_diffusion_pretrain_zed_diffusion_2026-04-14_20-59-47/checkpoints/335000",
         "training.batch_size=16",
         "training.num_workers=4",
-        "wandb.enable=false" ,
+        "wandb.enable=true" ,
     ]
     
     for arg in default_args:

@@ -23,16 +23,36 @@ class GuidedVisionEnv(gym.Env):
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 25}
 
-    def __init__(self, xml_path, cameras=CAMERAS): 
+    def __init__(self, 
+            xml_path: str,
+            num_arms: int = 3,
+            cameras: list[str] = CAMERAS,
+            observation_height: int = 480,
+            observation_width: int = 640,
+        ):
         super().__init__()
         # self.num_envs = 1
         # ==========================================
         # 🌟 1. 加载物理模型
         # ==========================================
         self._mjcf_root = mjcf.from_path(xml_path)  
+        self.observation_height = observation_height
+        self.observation_width = observation_width   
         self._mjcf_root.option.timestep = SIM_PHYSICS_DT  
         self._physics = mjcf.Physics.from_mjcf_model(self._mjcf_root) 
+        assert all([camera in CAMERAS for camera in cameras]), f"Invalid camera names: {cameras}"
         self.cameras = cameras # 使用的摄像头列表
+        assert num_arms in [2, 3], f"Invalid number of arms: {num_arms}"
+        self.num_arms = num_arms
+
+        self._middle_base_link = self._mjcf_root.find('body', MIDDLE_BASE_LINK)
+        self._middle_base_link_init_pos = self._middle_base_link.pos.copy()
+
+        if self.num_arms == 2:
+            self.hide_middle_arm() # HACK, 隐藏中央机械臂
+            self.num_joints = 14
+        elif self.num_arms == 3:
+            self.num_joints = 21
         # ==========================================
         # 🌟 2. 构建观察空间 (Observation Space)
         # ==========================================
@@ -46,7 +66,7 @@ class GuidedVisionEnv(gym.Env):
             
         # 注册 21维本体状态
         obs_spaces['observation.state'] = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(21,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.num_joints,), dtype=np.float32
         ) 
         
         self.observation_space = spaces.Dict(obs_spaces)
@@ -55,14 +75,13 @@ class GuidedVisionEnv(gym.Env):
         # 🌟 3. 定义动作空间 (Action Space): 21维关节目标角度
         # ==========================================
         self.action_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(21,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.num_joints,), dtype=np.float32
         )   
         
         # ==========================================
         # 🌟 4. 寻址与绑定 MJCF 节点，和底层的 MuJoCo XML 物理模型之间建立连接
         # ==========================================
-        self._middle_base_link = self._mjcf_root.find('body', MIDDLE_BASE_LINK)
-        self._middle_base_link_init_pos = self._middle_base_link.pos.copy()
+
         # 绑定关节，用于读取关节角度
         self._left_joints = [self._mjcf_root.find('joint', name) for name in LEFT_JOINT_NAMES]
         self._right_joints = [self._mjcf_root.find('joint', name) for name in RIGHT_JOINT_NAMES]
@@ -103,13 +122,17 @@ class GuidedVisionEnv(gym.Env):
         
         middle_qpos = self._physics.bind(self._middle_joints).qpos.copy()
         
-        state_21d = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float32)
+        if self.num_arms == 2:
+            agent_pos = np.concatenate([left_qpos, right_qpos]).astype(np.float32)
+        elif self.num_arms == 3:
+            agent_pos = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float32) 
+        # state_21d = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float32)
 
         # ==========================================
         # 🌟 2. 渲染相机图像并转换通道为 (C, H, W)
         # ==========================================
         # 2. 准备返回的字典
-        obs_dict = {'observation.state': state_21d}
+        obs_dict = {'observation.state': agent_pos}
         for cam_name in self.cameras:
             # 注意：这里的 camera_id 必须和你的 XML 文件里 <camera name="..."> 的名字完全一致！
             try:
@@ -152,12 +175,14 @@ class GuidedVisionEnv(gym.Env):
         left_gripper = np.clip(action[6], 0.0, 1.0) # 0.0 到 1.0 之间的归一化值
         right_joints = action[7:13]
         right_gripper = np.clip(action[13], 0.0, 1.0)
-        middle_joints = action[14:21]
+        if self.num_arms == 3:
+            middle_joints = action[14:21]
+            self._physics.bind(self._middle_actuators).ctrl = middle_joints
 
         # 2. 映射到物理引擎执行器
         self._physics.bind(self._left_actuators[:6]).ctrl = left_joints
         self._physics.bind(self._right_actuators[:6]).ctrl = right_joints
-        self._physics.bind(self._middle_actuators).ctrl = middle_joints
+
         self._physics.bind(self._left_actuators[6]).ctrl = self.left_gripper_unnorm_fn(left_gripper)
         self._physics.bind(self._right_actuators[6]).ctrl = self.right_gripper_unnorm_fn(right_gripper)
 
@@ -205,6 +230,11 @@ class GuidedVisionEnv(gym.Env):
             )
         self._viewer.sync()
 
+    # 将中间臂隐藏（移出视角外）
+    def hide_middle_arm(self):
+        self._physics.bind(self._middle_base_link).pos = np.array([0, -2.4, -0.4]) # HACK
+
+
     def close(self) -> None:
         if self._viewer is not None:
             self._viewer.close()
@@ -214,9 +244,9 @@ class SewNeedleEnv(GuidedVisionEnv):
     """
     缝合针穿引任务专用环境
     """
-    def __init__(self,cameras):
+    def __init__(self,**kwargs):
         xml_path = os.path.join(XML_DIR, 'task_sew_needle.xml')
-        super().__init__(xml_path, cameras=cameras)
+        super().__init__(xml_path, **kwargs)
 
         self.max_reward = 5
         self._needle_joint = self._mjcf_root.find('joint', 'needle_joint')
