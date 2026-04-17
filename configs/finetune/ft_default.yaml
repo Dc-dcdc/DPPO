@@ -5,7 +5,8 @@ defaults:
   - _self_                      # 允许本文件覆盖上面的默认值
   - policy: ft_zed_diffusion   
 
-
+resume: false
+resume_path: none
 device: "cuda:0"  # cuda或cpu
 
 hydra:
@@ -16,13 +17,16 @@ hydra:
     name: default
 
 training:
-  pretrained_ckpt_path: "outputs/pretrain/train/2026-04-13/11-21-21_guided_vision_diffusion_default/checkpoints/050000"
+  pretrained_ckpt_path: "outputs/pretrain/train/.../checkpoints/050000"
   rollout_steps: 500
 
 
 wandb:
   enable: true
   # Set to true to disable saving an artifact despite save_checkpoint == True
-  disable_artifact: false
-  project: lerobot
+  disable_artifact: true # 不保存artifact，即不上传权重模型
+  project: finetune  #项目名称
   notes: ""
+  save_code: false  # 是否保存代码
+
+seed: ???

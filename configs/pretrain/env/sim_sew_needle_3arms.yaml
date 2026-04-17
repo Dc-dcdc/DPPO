@@ -15,3 +15,6 @@ env:
   action_dim: 21
   fps: ${fps}
   episode_length: 300
+
+wandb:
+  project: ${env.task}_finetune

@@ -56,7 +56,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
             # 3. 推理获取动作
             with torch.no_grad():
                 # 使用lerobot自带的推理函数
-                action = policy.select_action(batch)
+                action = policy.select_action(batch) # 这里每次取出一个动作，推理依旧一次生成8个动作，只是一个个往外取
             
             # 4. 把模型输出的 Tensor 动作转回 Numpy
             action_np = action.squeeze(0).cpu().numpy()
@@ -124,7 +124,7 @@ def evaluate_and_checkpoint_if_needed(
             logging.info(f"✅ 评估完毕! 成功率: {sr*100:.1f}%, 平均奖励: {ar:.2f}")
 
             if getattr(cfg, "wandb", {}).get("enable", False) and len(eval_info["video_paths"]) > 0:
-                logger.log_video(eval_info["video_paths"][0], step, mode="eval") 
+                logger.log_video(eval_info["video_paths"][0], step, mode="eval") # 只上传第一个视频到 wandb
 
     # 2. 保存检查点逻辑
     is_last_step = (step == cfg.training.offline_steps - 1)
@@ -155,7 +155,7 @@ if __name__ == "__main__":
     # ==========================================
     eval_cfg = SimpleNamespace(
         # 📂 模型路径设置 (直接指向 000000 这样的数字文件夹即可，代码会自动寻找内部结构)
-        ckpt_path="outputs/pretrain/train/2026-04-15/12-42-37_sim_envs_diffusion_pretrain_zed_diffusion_2026-04-15_12-42-37/checkpoints/040000",
+        ckpt_path="outputs/pretrain/train/2026-04-15/22-11-55_sim_envs_diffusion_pretrain_zed_diffusion_2026-04-15_22-11-55/checkpoints/0620000",
         name = 'sim_envs', #会自动加载，可以不改
         task = 'SewNeedle-3Arms-v0', #会自动加载，可以不改
         # ⚙️ 评估参数设置

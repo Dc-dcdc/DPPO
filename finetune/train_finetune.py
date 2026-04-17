@@ -1,4 +1,7 @@
 import os
+# 没有显示器时使用，比如在服务器上
+# os.environ["MUJOCO_GL"] = "egl"
+# os.environ["EGL_DEVICE_ID"] = "0"
 import sys
 import math
 import torch
@@ -9,6 +12,11 @@ from omegaconf import DictConfig, OmegaConf
 from pathlib import Path
 import hydra
 import yaml
+import gymnasium as gym
+from lerobot.common.utils.utils import init_logging, set_global_seed
+from pprint import pformat
+from lerobot.common.logger import Logger
+from tqdm import tqdm
 # 路径处理
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
@@ -16,13 +24,174 @@ if ROOT_DIR not in sys.path:
 
 from env.sim_envs import SewNeedleEnv
 from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
-from lerobot.common.utils.utils import get_safe_torch_device
+from lerobot.common.utils.utils import get_safe_torch_device 
+from lerobot.common.policies.utils import (
+    get_device_from_parameters,
+    get_dtype_from_parameters,
+    populate_queues,
+)
 from finetune.critic import ImageCritic
 
-def train_dppo_finetune(cfg: DictConfig, out_dir: str):
-    device = get_safe_torch_device("cuda")
-    logging.info(f"🚀 启动 DPPO 强化学习微调... 设备: {device}")
 
+import torch
+from types import MethodType
+
+@torch.no_grad()
+def forward_dppo(self, cond: dict, return_chain=True):
+    """
+    专为 LeRobot DiffusionPolicy 定制的 DPPO 推理函数。
+    拦截并保存扩散去噪链，同时完美兼容 LeRobot 的多帧观测缓存机制 (queues)。
+    """
+    self.eval()
+    
+    # ==========================================
+    # 1. 观测输入归一化与多帧堆叠 (完美复刻 select_action 逻辑)
+    # ==========================================
+    batch = self.normalize_inputs(cond.copy())
+    # 按照 LeRobot 源码将多个相机的图像堆叠在一个张量里
+    if len(self.expected_image_keys) > 0:
+        batch = dict(batch)
+        batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
+        
+    # 重点：把当前帧塞进历史队列 (Queue) 中
+    self._queues = populate_queues(self._queues, batch)
+    
+    # 从队列中提取包含了 n_obs_steps 帧的历史数据
+    stacked_batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+    
+    # 获取动态的 batch_size (即并行的 n_envs 个数) 和设备
+    batch_size = next(iter(stacked_batch.values())).shape[0]
+    device = get_device_from_parameters(self)
+    dtype = get_dtype_from_parameters(self)
+    
+    # ==========================================
+    # 2. 提取视觉和状态的全局条件 (Global Conditioning)
+    # ==========================================
+    # 🌟 修正点：直接调用 DiffusionModel 内置的完美处理函数
+    global_cond = self.diffusion._prepare_global_conditioning(stacked_batch)
+    
+    # ==========================================
+    # 3. 初始化纯噪声 [Batch, Horizon, Action_Dim]
+    # ==========================================
+    action_dim = self.config.output_shapes["action"][0]
+    trajectory = torch.randn(
+        size=(batch_size, self.config.horizon, action_dim),
+        dtype=dtype,
+        device=device
+    )
+    
+    # ==========================================
+    # 4. 配置 Scheduler 步数并计算截断起点
+    # ==========================================
+    num_inference_steps = self.diffusion.num_inference_steps
+    self.diffusion.noise_scheduler.set_timesteps(num_inference_steps)
+    timesteps = self.diffusion.noise_scheduler.timesteps
+    
+    ft_denoising_steps = getattr(self.config, "ft_denoising_steps", 10)
+    record_start_idx = len(timesteps) - ft_denoising_steps
+    if record_start_idx < 0:
+        record_start_idx = 0 
+        
+    chains = []
+    
+    # ==========================================
+    # 5. 手动展开去噪循环 (Denoising Loop)
+    # ==========================================
+    for i, t in enumerate(timesteps):
+        # 🌟 保存当前的带噪状态 x_t
+        if return_chain and i >= record_start_idx:
+            chains.append(trajectory.clone())
+            
+        # 🌟 修正点：调用底层的 UNet 进行预测，注意时间步的数据类型对齐
+        timestep_tensor = torch.full(trajectory.shape[:1], t, dtype=torch.long, device=device)
+        model_output = self.diffusion.unet(
+            trajectory,
+            timestep_tensor,
+            global_cond=global_cond
+        )
+        
+        # Scheduler 步进：求出更干净的 x_{t-1}
+        trajectory = self.diffusion.noise_scheduler.step(
+            model_output, t, trajectory
+        ).prev_sample
+
+    # 追加最后完全干净的状态 x_0 (Final Action)
+    if return_chain and len(chains) < ft_denoising_steps + 1:
+        chains.append(trajectory.clone())
+        
+    # 堆叠维度：[Batch, ft_denoising_steps + 1, Horizon, Action_Dim]
+    chains_tensor = torch.stack(chains, dim=1) if return_chain else None
+    
+    # ==========================================
+    # 6. 反归一化并输出完整的 Horizon
+    # ==========================================
+    out_dict = self.unnormalize_outputs({"action": trajectory})
+    final_actions = out_dict["action"]
+    
+    return {
+        "actions": final_actions,       # 完整的预测动作序列 [Batch, Horizon, Action_Dim]
+        "chains": chains_tensor         # 去噪链，+1是因为保存了纯噪声  [Batch, ft_denoising_steps + 1, Horizon, Action_Dim]
+    }
+
+
+# ==========================================
+# 🌟  定义 PPO 概率计算函数
+# ==========================================
+def get_logprobs(self, cond: dict, x_t: torch.Tensor, x_t_1: torch.Tensor, timesteps: torch.Tensor):
+    """
+    计算扩散模型从 x_t 转移到 x_{t-1} 的对数概率 (Log-Likelihood)。
+    基于 DDIM (预测 Epsilon) 的数学展开。
+    """
+    # 1. 提取条件特征 (复用 LeRobot 底层逻辑)
+    batch = self.normalize_inputs(cond.copy())
+    if len(self.expected_image_keys) > 0:
+        batch = dict(batch)
+        batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
+    global_cond = self.diffusion._prepare_global_conditioning(batch)
+
+    # 2. UNet 预测噪声 (Epsilon)
+    noise_pred = self.diffusion.unet(x_t, timesteps, global_cond=global_cond)
+
+    # 3. 计算 DDIM 确定的均值 (mu)
+    # 因为 Diffusers 的 step 接口不支持批量 timestep 张量运算，
+    # 我们通过遍历 Batch 维度来确保安全的梯度传播和时间步映射。
+    mu = torch.empty_like(x_t)
+    for i in range(x_t.shape[0]):
+        t_val = timesteps[i].item()
+        step_out = self.diffusion.noise_scheduler.step(
+            model_output=noise_pred[i:i+1],
+            timestep=t_val,
+            sample=x_t[i:i+1]
+        )
+        mu[i] = step_out.prev_sample[0]
+
+    # 4. 强制注入 RL 探索方差 (因为 DDIM 默认方差为0)
+    std = getattr(self.config, "min_sampling_denoising_std", 0.05)
+    var = std ** 2
+
+    # 5. 高斯分布的对数概率公式: -0.5 * ((x - mu)/std)^2 - log(std) - 0.5 * log(2*pi)
+    log_prob = -0.5 * ((x_t_1 - mu) ** 2) / var - math.log(std) - 0.5 * math.log(2 * math.pi)
+    
+    # 将概率在动作序列维度求和 (累乘转化为对数累加)
+    log_prob = log_prob.flatten(start_dim=1).sum(dim=-1)
+
+    # 6. 计算高斯分布的香农熵 (用于 PPO 探索正则化)
+    action_dim_total = x_t.shape[1] * x_t.shape[2]
+    entropy = action_dim_total * (0.5 * math.log(2 * math.pi * math.e * var))
+
+    return log_prob, entropy
+
+def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
+    """
+    DPPO 第二阶段：在预训练参数上采用PPO算法进行微调 
+    """
+    init_logging() #初始化日志
+    logging.info(pformat(OmegaConf.to_container(cfg))) #打印配置cfg
+
+    # 初始化日志记录器与设备
+    logger = Logger(cfg, out_dir, wandb_job_name=job_name)
+    set_global_seed(cfg.seed)
+    device = get_safe_torch_device(cfg.device, log=True)
     # ==========================================
     # 1. 配置对齐与初始化 (环境、Actor、Critic)
     # ==========================================
@@ -39,7 +208,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str):
         load_dir = ckpt_path # 兼容其他保存格式
 
     # 准备设备 (传入 "cuda" 防止新版本报错)
-    device = get_safe_torch_device("cuda")
+    device = get_safe_torch_device(cfg.device, log=True)
     print(f"🚀 初始化评估程序... 使用设备: {device}")
 
     # 实例化 Policy 并加载权重
@@ -50,203 +219,477 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str):
         # ==========================================
         # 像加载常规 Hugging Face 模型一样，直接读取文件夹
         actor = DiffusionPolicy.from_pretrained(load_dir)
-        
-        # 手动推入 GPU
-        actor.to(device)
+        actor.to(device)  # 手动推入 GPU
+        # 🌟🌟🌟 新增：动态挂载我们刚写的 DPPO 前向函数,
+        actor.forward_dppo = MethodType(forward_dppo, actor) # 将forward_dppo绑定到实例中
+        actor.get_logprobs = MethodType(get_logprobs, actor) # 将get_logprobs绑定到实例中
     except Exception as e:
         raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
     
-    # 提取相机配置并初始化环境与 Critic
-    all_obs_keys = actor.config.input_shapes.keys()
-    # 读取预训练配置文件中policy.input_shapes中的相机配置，用于初始化环境，保证相机名称顺序一致
-    ref_cams = [k.replace("observation.images.", "") for k in all_obs_keys if "observation.images." in k]
-    action_shape = actor.config.output_shapes.get("action", [horizon_steps, 14]) # 默认 14 维
-    action_dim = action_shape[-1]  # 取最后一位作为动作维度
-    if not ref_cams:
-        raise ValueError(f"❌ 严重冲突：模型中未找到相机相关参数。请检查模型快照重是否正确。")
+    # ==========================================
+    # 2. 读取预训练配置文件中输入输出配置，保证与环境对齐
+    # ==========================================
+    ref_cams = [k.replace("observation.images.", "") for k in actor.config.input_shapes.keys() if "observation.images." in k]
+    horizon_steps = getattr(actor.config, "horizon", None)
+    action_dim = actor.config.output_shapes.get("action", [None])[-1]
+    state_dim = actor.config.input_shapes.get("observation.state", [None])[0]
+    if not (ref_cams and horizon_steps and action_dim and state_dim): 
+        raise ValueError("❌ 严重冲突：模型中未找到关键参数 (ref_cams, horizon, action_dim)。请检查模型快照是否正确。")
+
+    # 动态读取环境配置
+    config_yaml_path = Path(load_dir) / "config.yaml"
+    if config_yaml_path.exists():
+        with open(config_yaml_path, "r") as f:
+            full_cfg = yaml.safe_load(f)
+            # 从 YAML 字典中提取 env_name 和 env_task
+            env_cfg = full_cfg.get("env", {})
+            env_name = env_cfg.get("name")
+            env_task = env_cfg.get("task")
+            
+            if not env_name or not env_task:
+                raise ValueError("❌ config.yaml 中缺少环境的 name 或 task 字段！")
+    else:
+        raise ValueError(f"❌ 严重错误: 在 {load_dir} 中未找到 config.yaml，无法确定微调环境配置！")
     
-    env = SewNeedleEnv(cameras=list(dict.fromkeys(ref_cams + list(cfg.env.render_camera))))
-    critic = ImageCritic(camera_names=ref_cams).to(device)
+    env_id = f"{env_name}/{env_task}" 
+    
+    logging.info(f"✅正在通过 Gym 注册表构建环境: {env_id}")
+    # ==========================================
+    # 3. 初始化环境与 Critic
+    # ==========================================
+    # 提取 n_envs 参数
+    n_envs = getattr(cfg.env, "n_envs", 1)
+    obs_cameras = list(dict.fromkeys(ref_cams + list(cfg.env.render_camera)))
+    # 定义一个创建单个环境的闭包函数
+    def make_env_fn():
+        return gym.make(id=env_id, cameras=obs_cameras)
+
+    if n_envs > 1:
+        # 使用 AsyncVectorEnv 自动拉起多个进程
+        env = gym.vector.AsyncVectorEnv(
+            [make_env_fn for _ in range(n_envs)],
+            shared_memory=True,  # 👈 开启官方内置的共享内存优化，防止传图像时卡顿！
+            context="spawn"  # 👈 强制安全启动子进程，防止 OpenGL/CUDA 崩溃
+            )
+        logging.info(f"✅成功启动 {n_envs} 个并行多进程环境...")
+    else:
+        env = gym.make(id=env_id, cameras=obs_cameras)
+        logging.info(f"✅成功启动单环境模式...")
+
+    # 3. 初始化 Critic，传入真实的 state_dim
+    critic = ImageCritic(
+        camera_names=ref_cams,
+        state_dim=state_dim  # 👈 强制替换掉硬编码的 21
+    ).to(device)
 
     # ==========================================
-    # 2. 初始化优化器与超参数 (对应原版 init)
+    # 3. 初始化优化器与超参数 (对应原版 init)
     # ==========================================
     actor_optimizer = torch.optim.AdamW(actor.parameters(), lr=cfg.training.actor_lr)
     critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=cfg.training.critic_lr)
-
+    print("Scheduler Type:", actor.config.noise_scheduler_type)
+    print("Prediction Type:", actor.config.prediction_type)
+    # 从配置中提取 RL 收集参数 (提供后备默认值)
+    n_steps = getattr(cfg.training, "rollout_steps", 256)   # 每次更新前收集的步数
+    act_steps = getattr(cfg.policy, "n_action_steps", 8) 
+    denoising_steps = getattr(cfg.policy, "ft_denoising_steps", 10)
     # ==========================================
     # 🌟 主循环：DPPO 强化学习全流程
     # ==========================================
     for itr in range(cfg.training.n_train_itr):
         logging.info(f"\n========== 第 {itr+1}/{cfg.training.n_train_itr} 轮迭代 ==========")
         
-        # 容器初始化
-        obs_list, chains_list, rewards_list, dones_list = [], [], [], []
+        # ==========================================
+        # 1. 初始化 DPPO Rollout 缓冲区 (Buffers)
+        # ==========================================
+        # 首次重置环境获取结构
+        prev_obs, _ = env.reset()
         
-        obs, _ = env.reset()
-        actor.reset()
-        actor.eval()
-        critic.eval()
+        # 预分配轨迹内存，k对应相机/状态,v对应数据形状
+        obs_trajs = {
+            k: np.zeros((n_steps, n_envs, *v.shape), dtype=np.float32)
+            for k, v in prev_obs.items()
+        }
         
-        # ------------------------------------------
-        # 步骤 A：Rollout 数据收集
-        # ------------------------------------------
-        logging.info("🏃 正在与环境交互收集数据 (Rollout)...")
-        for step in range(cfg.training.rollout_steps):
-            # 将 Numpy 字典转为 Tensor 字典送入模型
-            batch = {}
-            for k, v in obs.items():
-                v_safe = v.copy() # 强制在内存中拷贝一份连续的数据防报错
+        # 核心：保存去噪链 (Chains) 用于计算 Logprob
+        chains_trajs = np.zeros(
+            # (步数，环境数，去噪步数，预测步数，动作维度)
+            (n_steps, n_envs, denoising_steps + 1, horizon_steps, action_dim),
+            dtype=np.float32
+        )
+        
+        reward_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
+        terminated_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
+
+        # ==========================================
+        # 4. 开始收集环境交互数据 (Rollout Loop)
+        # ==========================================
+        logging.info(f"🏃 开始进入数据收集循环 (共 {n_steps} 步)...")
+        running_ep_rewards = np.zeros(n_envs, dtype=np.float32)  # 记录当前每个环境正在跑的回合的累计分数
+        completed_ep_rewards = []                                # 存放所有【已经跑完】的回合的总分
+        completed_ep_successes = []                              # 存放成功标志 (假设环境 info 里有 success 信息)
+        for step in range(n_steps):
+            if step > 0 and step % 10 == 0:
+                logging.info(f"  > 已收集 {step}/{n_steps} 步...")
+
+            # 1. 格式化当前观测：Numpy -> PyTorch Tensor
+            batch_obs = {}
+            for k, v in prev_obs.items():
+                tensor_v = torch.from_numpy(v.copy()).float().to(device)
+                # 兼容单环境:n_envs=1,数据形状=[C, H, W]，不符合输入，需要增加维度，多环境形状为[n_envs, C, H, W]
+                if n_envs == 1 and tensor_v.dim() == len(v.shape):
+                    # [C, H, W] -> [1, C, H, W]   [state] -> [1, state]
+                    tensor_v = tensor_v.unsqueeze(0)
+                
+                # 图像归一化处理
                 if "images" in k:
-                    # 图片：[C, H, W] -> [1, C, H, W] -> 归一化
-                    tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device) / 255.0
-                else:
-                    # 状态：[21] -> [1, 21]
-                    tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device)
-                batch[k] = tensor_v
-            
+                    tensor_v = tensor_v / 255.0
+                    
+                batch_obs[k] = tensor_v
+
+            # 2. 网络前向传播获取动作与去噪链
             with torch.no_grad():
-                # ⚠️ 核心接口预留：未来的 Actor 必须返回 Diffusion 的降噪链 (chains)
-                # 对应原代码 samples = self.model(cond=cond, return_chain=True)
-                # 目前暂用标准 select_action 占位，链条用 dummy 代替
-                action_tensor = actor.select_action(batch)
-                chains_trajs = torch.zeros(  # 扩散模型降噪链轨迹缓存
-                    (
-                        cfg.n_envs, # 环境数
-                        cfg.ft_denoising_steps + 1, # 降噪步数，第一步存的纯随机噪声
-                        cfg.horizon_steps, # 预测未来步数
-                        cfg.action_dim, # 动作维度
-                    ), device=device)
-            action_np = action_tensor[0].cpu().numpy()
-            if len(action_np.shape) > 1: action_np = action_np[0]
-            
-            next_obs, reward, terminated, truncated, _ = env.step(action_np)
-            done = terminated or truncated
-
-            # 存储数据
-            obs_list.append(batch)
-            chains_list.append(chains_trajs)
-            rewards_list.append(reward)
-            dones_list.append(done)
-
-            obs = next_obs
-            if done:
-                obs, _ = env.reset()
-                actor.reset()
+                # ⚠️ 注意：此处需确保 actor 有返回 chains 的接口
+                # 标准的 actor.select_action 不返回 chains，DPPO 通常需要调用底层的 forward 或特定生成函数
+                # 此处仿照参考代码：返回 deterministic=False 的采样以及 return_chain=True
+                samples = actor.forward_dppo(cond=batch_obs, return_chain=True) 
                 
-        # ------------------------------------------
-        # 步骤 B：Critic 价值评估与旧概率计算
-        # ------------------------------------------
-        logging.info("🧠 计算状态价值 (Value) 与旧动作概率 (Old Logprobs)...")
-        values_list = []
-        old_logprobs_list = []
+                output_venv = samples["actions"].cpu().numpy()  # shape: [n_envs, horizon, action_dim]
+                chains_venv = samples["chains"].cpu().numpy()   # shape: [n_envs, denoising_steps+1, horizon, action_dim]
+
+            # 截取实际执行的动作长度 (Action Chunking)
+            action_venv = output_venv[:, :act_steps]
+
+            # ==========================================
+            # 🌟 手动展开动作序列块 (Chunking Loop)
+            # 网络一次预测了 8 步，我们必须让物理环境分 8 次真实执行
+            # ==========================================
+            chunk_reward = np.zeros(n_envs, dtype=np.float32)
+            done_venv_accum = np.zeros(n_envs, dtype=bool)
+
+            for step_i in range(act_steps):
+                # 1. 提取当前这一小步的动作，形状变为: [n_envs, action_dim]
+                curr_action = action_venv[:, step_i, :]
+                
+                # 单环境降维处理: 从 [1, 14] 降为 [14] 给原生 Gym 识别
+                action_to_step = curr_action[0] if n_envs == 1 else curr_action
+
+                # 2. 与物理引擎交互 (执行 1 步)
+                obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = env.step(action_to_step)
+
+                # 单环境标量兼容处理
+                if n_envs == 1:
+                    reward_venv = np.array([reward_venv])
+                    terminated_venv = np.array([terminated_venv])
+                    truncated_venv = np.array([truncated_venv])
+                
+                # 3. 极其重要的细节：计算掩码 (Mask)
+                # 如果某个并行环境在第 3 步就已经 done 了，Gym 会在底层自动复活它。
+                # 为了防止网络误把后续第 4-8 步的动作算进新任务的奖励里，我们需要掩蔽已结束的环境。
+                active_mask = ~done_venv_accum
+                chunk_reward += reward_venv * active_mask
+                
+                # 更新累积的终止状态
+                done_venv_accum = done_venv_accum | terminated_venv | truncated_venv
+                
+                # 4. 单环境的特殊处理：如果跑完了，必须手动重置并强行跳出当前 Chunk
+                if n_envs == 1 and done_venv_accum[0]:
+                    obs_venv, _ = env.reset()
+                    break
+            # 🌟 核心替代逻辑：在循环内部顺手统计
+            # 1. 累加当前步的奖励
+            running_ep_rewards += chunk_reward
+            
+            # 2. 检查哪些环境结束了
+            for env_idx in range(n_envs):
+                if done_venv_accum[env_idx]:
+                    # 记录跑完的回合总分
+                    completed_ep_rewards.append(running_ep_rewards[env_idx])
+                    
+                    # 如果你的环境会返回成功与否，也可以记录
+                    # is_success = info_venv[env_idx].get("is_success", False)
+                    # completed_ep_successes.append(is_success)
+                    
+                    # 清零这个环境的累计器，准备迎接它的下一个新回合
+                    running_ep_rewards[env_idx] = 0.0
+            # 循环结束：将这 8 步累积的完整奖励和结束标志，交给外部的 PPO 缓冲区
+            reward_venv = chunk_reward
+            # =========================================================
+
+            # 4. 写入轨迹 Buffer
+            for k in obs_trajs:
+                # 写入执行动作前的观测
+                obs_trajs[k][step] = prev_obs[k] if n_envs > 1 else np.expand_dims(prev_obs[k], 0)
+                
+            chains_trajs[step] = chains_venv            # [n_steps, n_envs, denoising_steps + 1, horizon_steps, action_dim]
+            reward_trajs[step] = reward_venv            # [n_steps, n_envs]
+            terminated_trajs[step] = terminated_venv    # [n_steps, n_envs]
+
+            # 5. 状态流转
+            prev_obs = obs_venv
+
+        logging.info("✅ 数据收集 (Rollout) 完成，准备进入 PPO 网络更新阶段！")
+                
+        # =========================================================
+        # 5. 批量计算价值 (Values) 与 GAE 优势函数
+        # =========================================================
+        logging.info("🧠 计算状态价值 (Values) 与优势函数 (GAE)...")
+        
+        # 1. 将收集到的字典张量展平，形状由 [n_steps, n_envs, ...] 变为 [n_steps*n_envs, ...] ，相当于是n_steps*n_envs个样本
+        # 为防止显存爆掉，先不加 .to(device)，让它留在 CPU 内存中！
+        obs_k_cpu = {
+            k: einops.rearrange(torch.from_numpy(v), "s e ... -> (s e) ...")
+            for k, v in obs_trajs.items()
+        }
         
         with torch.no_grad():
-            for i in range(cfg.training.rollout_steps):
-                b_obs = obs_list[i]
-                b_chain = chains_list[i]
+            # 🌟 修复 2：分批次 (Mini-batch) 计算 Critic 价值，防止显存爆炸
+            total_samples = n_steps * n_envs
+            val_batch_size = getattr(cfg.training, "batch_size", 32) * 2  # 评估不算梯度，batch 可以开大点
+            values_flat = np.zeros(total_samples, dtype=np.float32)
+            
+            for i in range(0, total_samples, val_batch_size):
+                end_i = min(i + val_batch_size, total_samples)
                 
-                # 1. 算出 V(s)
-                val = critic(b_obs).item()
-                values_list.append(val)
+                # 临时切下一小块推入 GPU，并顺手除以 255.0
+                obs_chunk = {}
+                for k, v in obs_k_cpu.items():
+                    tensor_v = v[i:end_i].float().to(device)
+                    if "images" in k:
+                        tensor_v = tensor_v / 255.0
+                        # 🌟 新增：如果是图像，且是 5D 张量 [Batch, Obs_Steps, C, H, W]
+                        # 我们只取最新的一帧 (索引 -1) 喂给 Critic
+                        if tensor_v.dim() == 5:
+                            tensor_v = tensor_v[:, -1]
+                    else:
+                        # 🌟 新增修复：剥离 State 的历史帧: [B, T, StateDim] -> [B, StateDim]
+                        if tensor_v.dim() == 3:
+                            tensor_v = tensor_v[:, -1]
+                    obs_chunk[k] = tensor_v
                 
-                # 2. 算出旧策略概率 log π_old(a|s)
-                # ⚠️ 核心接口预留：未来的 Actor 必须具备计算 logprob 的能力
-                dummy_logprob = torch.zeros(1, device=device) 
-                old_logprobs_list.append(dummy_logprob)
+                # 计算这批数据的 Value 并塞回 CPU 数组
+                values_flat[i:end_i] = critic(obs_chunk).cpu().numpy().flatten()
+                
+            values_trajs = values_flat.reshape(n_steps, n_envs)
+            
+            # 计算最后一步的 Next Value (Bootstrap)
+            last_obs_ts = {}
+            for k, v in prev_obs.items():
+                tensor_v = torch.from_numpy(v).float().to(device)
+                if n_envs == 1 and tensor_v.dim() == len(v.shape):
+                    tensor_v = tensor_v.unsqueeze(0)
+                if "images" in k: 
+                    tensor_v = tensor_v / 255.0
+                    # 🌟 新增：处理最后一步的帧缓存，取最新的一帧
+                    if tensor_v.dim() == 5:
+                        tensor_v = tensor_v[:, -1]
+                last_obs_ts[k] = tensor_v
+                
+            next_values_last = critic(last_obs_ts).cpu().numpy().flatten()
 
-        # ------------------------------------------
-        # 步骤 C：GAE (广义优势估计) 逆向时间旅行
-        # ------------------------------------------
-        logging.info("⚖️ 计算 GAE 优势函数...")
-        advantages = np.zeros(cfg.training.rollout_steps)
+        # 2. 计算 GAE (逆向时间推导)
+        advantages_trajs = np.zeros_like(reward_trajs)
         last_gae_lam = 0
-        
-        # 提前准备最后一步的 Next Value
-        with torch.no_grad():
-            last_batch = {}
-            for k, v in obs.items():
-                if "images" in k: last_batch[k] = torch.from_numpy(v).float().unsqueeze(0).to(device) / 255.0
-                else: last_batch[k] = torch.from_numpy(v).float().unsqueeze(0).to(device)
-            last_val = critic(last_batch).item()
+        gamma = getattr(cfg.training, "gamma", 0.99)
+        gae_lambda = getattr(cfg.training, "gae_lambda", 0.95)
 
-        for t in reversed(range(cfg.training.rollout_steps)):
-            next_val = last_val if t == cfg.training.rollout_steps - 1 else values_list[t + 1]
-            nonterminal = 1.0 - float(dones_list[t])
-            
+        for t in reversed(range(n_steps)):
+            # 获取下一步的 观测评估价值
+            next_val = next_values_last if t == n_steps - 1 else values_trajs[t + 1]
+            # 判断游戏是否结束，# 如果nonterminal为0，表示死亡或通关，那么未来价值都是0
+            nonterminal = 1.0 - terminated_trajs[t]
+
+            # 单步TD误差 = 第t步的奖励*缩放系数 + 折旧因子*下一步观测的价值 - 当前步观测的价值
             # TD 误差: δ = r + γ * V(s') * (1-done) - V(s)
-            delta = rewards_list[t] + cfg.training.gamma * next_val * nonterminal - values_list[t]
-            
+            delta = reward_trajs[t] + gamma * next_val * nonterminal - values_trajs[t]
+
+            # 优势值计算：t-1步的优势值 = TD误差 + 双重衰减系数*t-1步的优势值   一直迭代，一轮(n_steps步)就能算出所有步的优势值 
             # 优势值: A_t = δ_t + γ * λ * (1-done) * A_{t+1}
-            advantages[t] = last_gae_lam = delta + cfg.training.gamma * cfg.training.gae_lambda * nonterminal * last_gae_lam
-            
-        returns = advantages + np.array(values_list)
+            advantages_trajs[t] = last_gae_lam = delta + gamma * gae_lambda * nonterminal * last_gae_lam
+        
+        # Advantage = Return - Value,       优势 = 实际总回报 - 预期总回报
+        # aritic网络输出的是当前画面对应的未来总回报  Return = Advantage + Value，
+        returns_trajs = advantages_trajs + values_trajs # 用于训练critic网络
 
-        # 转换为 Tensor 准备训练
-        adv_t = torch.tensor(advantages, dtype=torch.float32, device=device)
-        ret_t = torch.tensor(returns, dtype=torch.float32, device=device)
-        val_t = torch.tensor(values_list, dtype=torch.float32, device=device)
-
-        # ------------------------------------------
-        # 步骤 D：PPO 多轮小批量更新 (Update Epochs)
-        # ------------------------------------------
-        logging.info(f"🔄 开始 PPO 网络更新 (Epochs: {cfg.training.update_epochs})...")
+        # =========================================================
+        # 6. DPPO 多轮小批量更新 (Update Epochs)
+        # =========================================================
+        logging.info(f"🔄 开始 PPO 网络更新 (Epochs: {getattr(cfg.training, 'update_epochs', 4)})...")
         actor.train()
         critic.train()
+
+        # 1. 准备训练用的展平张量
+        returns_k = torch.tensor(returns_trajs, device=device).float().reshape(-1)
+        advantages_k = torch.tensor(advantages_trajs, device=device).float().reshape(-1)
         
-        for epoch in range(cfg.training.update_epochs):
-            # 打乱索引
-            indices = torch.randperm(rollout_steps, device=device)
+        # 优势函数归一化 (极大地提升 PPO 训练稳定性)
+        advantages_k = (advantages_k - advantages_k.mean()) / (advantages_k.std() + 1e-8)
+        
+        # 将 Chains 展平为 [(步数*环境数), 去噪步数, 预测视野, 动作维度]
+        chains_k = einops.rearrange(
+            torch.tensor(chains_trajs, device=device).float(),
+            "s e t h d -> (s e) t h d"
+        )
+
+        total_steps = n_steps * n_envs * denoising_steps      # 包含去噪的步数 例如：15000=300*5*10
+
+        # 获取与去噪步对应的真实 TimeSteps
+        actor.diffusion.noise_scheduler.set_timesteps(actor.diffusion.num_inference_steps)
+        all_timesteps = actor.diffusion.noise_scheduler.timesteps
+        record_start_idx = max(0, len(all_timesteps) - denoising_steps)
+        recorded_timesteps = all_timesteps[record_start_idx:].to(device)
+
+        # =========================================================
+        # 7. 预计算旧策略的对数概率 (Old Logprobs)
+        # =========================================================
+        # 🌟 修复 3：预计算旧概率时，同样按需从 CPU 搬运数据
+        logging.info("🧠 正在预计算旧策略概率基准...")
+        old_logprobs_k = torch.zeros(total_steps, device=device)
+        with torch.no_grad():
+            eval_batch_size = getattr(cfg.training, "batch_size", 32) * 2
+            for i in range(0, total_steps, eval_batch_size):
+                inds = torch.arange(i, min(i + eval_batch_size, total_steps), device=device)
+                b_inds, d_inds = torch.unravel_index(inds, (n_steps * n_envs, denoising_steps))
+                
+                # 从 CPU 取出这一小批的画面放入 GPU
+                obs_eval = {}
+                for k, v in obs_k_cpu.items():
+                    tensor_v = v[b_inds.cpu()].float().to(device)
+                    if "images" in k:
+                        tensor_v = tensor_v / 255.0
+
+                    obs_eval[k] = tensor_v
+
+                logprobs, _ = actor.get_logprobs(
+                    cond=obs_eval, 
+                    x_t=chains_k[b_inds, d_inds], 
+                    x_t_1=chains_k[b_inds, d_inds + 1], 
+                    timesteps=recorded_timesteps[d_inds]
+                )
+                old_logprobs_k[inds] = logprobs
+
+        # 3. 开始 Epoch 循环
+        batch_size = getattr(cfg.training, "batch_size", 50)
+        update_epochs = getattr(cfg.training, "update_epochs", 10)
+        clip_ratio = getattr(cfg.training, "clip_ratio", 0.25)
+        entropy_coef = getattr(cfg.training, "entropy_coef", 1e-4)
+
+        # 2. 开始 Epoch 循环，PPO的数据集可以训练多轮，数据利用率高
+        for epoch in tqdm(range(update_epochs), desc=f"⏳ PPO 更新中 (Iter {itr+1})", leave=False):
+            # 打乱所有数据点 (不仅打乱时间步，还打乱去噪步)
+            indices = torch.randperm(total_steps, device=device)
+            num_batch = max(1, total_steps // batch_size) #分批次训练
             
-            for start_idx in range(0, rollout_steps, cfg.training.batch_size):
-                end_idx = start_idx + cfg.training.batch_size
-                batch_inds = indices[start_idx:end_idx]
+            for batch_idx in range(num_batch):
+                start = batch_idx * batch_size
+                end = start + batch_size
+                inds_b = indices[start:end] #从打乱的总数据中提取一个batch的索引
                 
-                # ... [由于 LeRobot 的限制，这里需要手动拼接字典 batch] ...
-                # 现实中会将 obs_list 堆叠成一个大的 Tensor，这里使用伪代码展示核心逻辑
+                # 将inds_b索引值对应到哪批样本batch_inds_b 的 哪个去噪步denoising_inds_b
+                batch_inds_b, denoising_inds_b = torch.unravel_index(
+                    inds_b, 
+                    (n_steps * n_envs, denoising_steps) #n_steps * n_envs行，denoising_steps列
+                )
                 
+                # 切片提取 Mini-batch
+                # 🌟 修复：创建两个字典，实现数据分流
+                obs_b = {}           # 给 Actor 用的（原汁原味，带历史帧）
+                obs_b_critic = {}    # 给 Critic 用的（单帧，降维后）
+                
+                for k, v in obs_k_cpu.items():
+                    tensor_v = v[batch_inds_b.cpu()].float().to(device)
+                    if "images" in k:
+                        tensor_v = tensor_v / 255.0
+                    
+                    # 1. 完整数据给 Actor
+                    obs_b[k] = tensor_v
+                    
+                    # 2. 剥离历史帧后给 Critic
+                    tensor_c = tensor_v
+                    if "images" in k and tensor_c.dim() == 5:
+                        tensor_c = tensor_c[:, -1]
+                    elif "images" not in k and tensor_c.dim() == 3:
+                        tensor_c = tensor_c[:, -1]
+                    
+                    obs_b_critic[k] = tensor_c
+                
+                # obs_b = {k: v[batch_inds_b] for k, v in obs_k.items()}        # 取出对应样本的观测，也就是对应环境和步数的观测
+                chains_prev_b = chains_k[batch_inds_b, denoising_inds_b]      # 对应样本的当前去噪步 动作
+                chains_next_b = chains_k[batch_inds_b, denoising_inds_b + 1]  # 对应样本的下一个去噪步 动作
+                returns_b = returns_k[batch_inds_b]                           # 对应样本的总回报
+                advantages_b = advantages_k[batch_inds_b]                     # 对应样本的优势值
+                timesteps_b = recorded_timesteps[denoising_inds_b]
+                
+                old_logprobs_b = old_logprobs_k[inds_b]
+                
+
                 actor_optimizer.zero_grad()
                 critic_optimizer.zero_grad()
                 
-                # 1. Critic Loss (均方误差)
-                # new_values = critic(batch_obs)
-                # v_loss = F.mse_loss(new_values, ret_t[batch_inds])
-                v_loss = torch.tensor(0.0, requires_grad=True, device=device) # 占位
+                # ----------------------------------------------------
+                # 🌟 网络 Loss 计算区 (真正的 PPO 数学魔法)
+                # ----------------------------------------------------
+                # 1. 计算当前网络对动作的新概率预测
+                new_logprobs_b, entropy_b = actor.get_logprobs(
+                    cond=obs_b, 
+                    x_t=chains_prev_b, 
+                    x_t_1=chains_next_b, 
+                    timesteps=timesteps_b
+                )
                 
-                # 2. Actor Loss (PPO Clip)
-                # new_logprobs = actor.get_logprobs(...)
-                # ratio = torch.exp(new_logprobs - old_logprobs[batch_inds])
-                # surr1 = ratio * adv_t[batch_inds]
-                # surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * adv_t[batch_inds]
-                # pg_loss = -torch.min(surr1, surr2).mean()
-                pg_loss = torch.tensor(0.0, requires_grad=True, device=device) # 占位
+                # 2. PPO 概率比 (Ratio): Ratio = exp(new_logprob - old_logprob)
+                ratio = torch.exp(new_logprobs_b - old_logprobs_b)
                 
-                # 3. 反向传播
-                loss = pg_loss + 0.5 * v_loss # 可以加上 entropy_loss 和 bc_loss
+                # 3. PPO 截断代理损失 (Clipped Surrogate Objective)
+                surr1 = ratio * advantages_b
+                surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages_b
+                pg_loss = -torch.min(surr1, surr2).mean()
+                
+                # 4. Critic MSE 损失
+                values_pred = critic(obs_b_critic).squeeze(-1)
+                v_loss = torch.nn.functional.mse_loss(values_pred, returns_b)
+                
+                # 5. 总 Loss 汇总
+                loss = pg_loss + 0.5 * v_loss - entropy_coef * entropy_b
                 loss.backward()
                 
-                # 梯度裁剪防爆炸
-                torch.nn.utils.clip_grad_norm_(actor.parameters(), max_norm=1.0)
-                torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
                 
                 actor_optimizer.step()
                 critic_optimizer.step()
                 
-        logging.info(f"✅ 第 {itr+1} 轮更新完成！平均奖励: {np.mean(rewards_list):.4f}")
+        # ------------------------------------------
+        # 步骤 E：打印评估指标 (替代原论文代码)
+        # ------------------------------------------
+        if len(completed_ep_rewards) > 0:
+            avg_ep_return = np.mean(completed_ep_rewards)
+            max_ep_return = np.max(completed_ep_rewards)
+            logging.info(f"✅ 第 {itr+1} 轮完成！")
+            logging.info(f"   🏃 本轮共完成回合数: {len(completed_ep_rewards)}")
+            logging.info(f"   💰 平均回合总奖励 (Return): {avg_ep_return:.2f}")
+            logging.info(f"   🏆 最高回合奖励: {max_ep_return:.2f}")
+            
+            # 如果配置了 WandB
+            # logger.log_dict({"train/avg_return": avg_ep_return}, step=itr)
+        else:
+            logging.info(f"⚠️ 第 {itr+1} 轮结束，但没有环境跑完一个完整回合 (考虑增加 rollout_steps)")
 
 @hydra.main(version_base="1.2", config_name="ft_default", config_path="../configs/finetune")
 def train_cli(cfg: DictConfig):
-    out_dir = hydra.core.hydra_config.HydraConfig.get().run.dir
-    train_dppo_finetune(cfg, out_dir)
-
+    train_dppo_finetune(
+        cfg,
+        out_dir=hydra.core.hydra_config.HydraConfig.get().run.dir,  # 获取当前训练运行的输出目录，用于保存训练输出的数据
+        job_name=hydra.core.hydra_config.HydraConfig.get().job.name, # 获取当前训练运行的作业名称，用于wandb
+    )
 if __name__ == "__main__":
     # 命令行参数注入
     default_args = [
         # "env=sim_sew_needle_3arms",
         "policy=ft_zed_diffusion",
-        "training.pretrained_ckpt_path=outputs/pretrain/train/2026-04-13/11-21-21_guided_vision_diffusion_default/checkpoints/320000",
-        "training.rollout_steps=500", 
-        "training.batch_size=32",     
+        "training.pretrained_ckpt_path=outputs/pretrain/train/2026-04-15/22-11-55_sim_envs_diffusion_pretrain_zed_diffusion_2026-04-15_22-11-55/checkpoints/0670000",
+        "training.rollout_steps=50", 
+        "training.batch_size=5",     
         "wandb.enable=false",
     ]
     

@@ -117,6 +117,7 @@ eval:
 wandb:
   enable: true
   # Set to true to disable saving an artifact despite save_checkpoint == True
-  disable_artifact: false
-  project: lerobot
+  disable_artifact: true # 不保存artifact，即不上传权重模型
+  project: pretrain #项目名称
   notes: ""
+  save_code: false  # 是否保存代码
