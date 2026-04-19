@@ -11,10 +11,10 @@ device: "cuda:0"  # cuda或cpu
 
 hydra:
   run:
-    dir: outputs/finetune/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.name}_${policy.name}_${hydra.job.name}
+    dir: outputs/finetune/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
     # dir: src/av-aloha/DPPO/outputs/pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.name}_${policy.name}_${hydra.job.name}
   job:
-    name: default
+    name: ${env.task}_${hydra.runtime.choices.policy}_${now:%Y-%m-%d}_${now:%H-%M-%S}
 
 training:
   pretrained_ckpt_path: "outputs/pretrain/train/.../checkpoints/050000"
@@ -25,7 +25,7 @@ wandb:
   enable: true
   # Set to true to disable saving an artifact despite save_checkpoint == True
   disable_artifact: true # 不保存artifact，即不上传权重模型
-  project: finetune  #项目名称
+  project: ${env.task}_finetune  #项目名称
   notes: ""
   save_code: false  # 是否保存代码
 

@@ -185,56 +185,62 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     """
     DPPO 第二阶段：在预训练参数上采用PPO算法进行微调 
     """
-    init_logging() #初始化日志
-    logging.info(pformat(OmegaConf.to_container(cfg))) #打印配置cfg
+    # ==========================================
+    # 1. 基础配置与日志初始化
+    # ==========================================
+    init_logging()
+    logging.info("🚀 启动 DPPO 微调程序...")
+    logging.info(f"配置参数:\n{pformat(OmegaConf.to_container(cfg))}")
 
-    # 初始化日志记录器与设备
+    # 初始化日志记录器与全局随机种子
     logger = Logger(cfg, out_dir, wandb_job_name=job_name)
     set_global_seed(cfg.seed)
+    
+    # 获取设备 
     device = get_safe_torch_device(cfg.device, log=True)
+    logging.info(f"💻 运行设备已绑定: {device}")
+
     # ==========================================
-    # 1. 配置对齐与初始化 (环境、Actor、Critic)
+    # 2. 权重路径检测与 Actor 网络加载
     # ==========================================
     ckpt_path = cfg.training.pretrained_ckpt_path
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"❌ 找不到权重路径: {ckpt_path}\n请检查路径是否正确。")
 
-    # 🌟 核心修改：自动探测 LeRobot 的 pretrained_model 子文件夹
+    # 自动探测 LeRobot 的 pretrained_model 子文件夹
     hf_model_dir = os.path.join(ckpt_path, "pretrained_model")
     if os.path.exists(hf_model_dir):
         print(f"🔍 检测到 LeRobot 标准快照结构，将自动读取子目录: pretrained_model")
         load_dir = hf_model_dir
     else:
         load_dir = ckpt_path # 兼容其他保存格式
-
-    # 准备设备 (传入 "cuda" 防止新版本报错)
-    device = get_safe_torch_device(cfg.device, log=True)
-    print(f"🚀 初始化评估程序... 使用设备: {device}")
-
-    # 实例化 Policy 并加载权重
-    print(f"💾 正在从目录重建网络并加载权重: {load_dir}")
+    logging.info(f"💾 正在从目录重建网络并加载权重: {load_dir}")
     try:
-        # ==========================================
-        # 🌟 直接使用 DiffusionPolicy 官方类，绕开所有版本不兼容的 API
-        # ==========================================
-        # 像加载常规 Hugging Face 模型一样，直接读取文件夹
+        # 直接使用 DiffusionPolicy 官方类加载权重
         actor = DiffusionPolicy.from_pretrained(load_dir)
         actor.to(device)  # 手动推入 GPU
-        # 🌟🌟🌟 新增：动态挂载我们刚写的 DPPO 前向函数,
+
+        # 动态挂载 DPPO 专用的前向与概率计算函数
         actor.forward_dppo = MethodType(forward_dppo, actor) # 将forward_dppo绑定到实例中
         actor.get_logprobs = MethodType(get_logprobs, actor) # 将get_logprobs绑定到实例中
+        logging.info("✅ 成功加载 Actor (DiffusionPolicy) 并挂载 DPPO 专用接口！")
     except Exception as e:
+        logging.error(f"❌ 权重加载失败！详细报错: {e}")
         raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
     
     # ==========================================
-    # 2. 读取预训练配置文件中输入输出配置，保证与环境对齐
+    # 3. 读取预训练配置文件中输入输出配置，保证与环境对齐
     # ==========================================
     ref_cams = [k.replace("observation.images.", "") for k in actor.config.input_shapes.keys() if "observation.images." in k]
     horizon_steps = getattr(actor.config, "horizon", None)
     action_dim = actor.config.output_shapes.get("action", [None])[-1]
     state_dim = actor.config.input_shapes.get("observation.state", [None])[0]
-    if not (ref_cams and horizon_steps and action_dim and state_dim): 
-        raise ValueError("❌ 严重冲突：模型中未找到关键参数 (ref_cams, horizon, action_dim)。请检查模型快照是否正确。")
+    # 优化 1：更严谨的校验，允许纯视觉策略 (state_dim=None)
+    if not ref_cams or horizon_steps is None or action_dim is None:
+        raise ValueError(f"❌ 严重冲突：模型快照中缺少关键参数 (ref_cams={ref_cams}, horizon={horizon_steps}, action_dim={action_dim})。")
+        
+    if state_dim is None:
+        logging.warning("⚠️ 模型配置中未检测到 observation.state，如果这是纯视觉策略，请忽略此警告。")
 
     # 动态读取环境配置
     config_yaml_path = Path(load_dir) / "config.yaml"
@@ -253,46 +259,71 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     
     env_id = f"{env_name}/{env_task}" 
     
-    logging.info(f"✅正在通过 Gym 注册表构建环境: {env_id}")
+    logging.info(f"🔄 准备通过 Gym 注册表构建环境: {env_id}")
     # ==========================================
-    # 3. 初始化环境与 Critic
+    # 4. 初始化环境与 Critic
     # ==========================================
-    # 提取 n_envs 参数
-    n_envs = getattr(cfg.env, "n_envs", 1)
-    obs_cameras = list(dict.fromkeys(ref_cams + list(cfg.env.render_camera)))
-    # 定义一个创建单个环境的闭包函数
-    def make_env_fn():
-        return gym.make(id=env_id, cameras=obs_cameras)
 
+    # ---------------------------------------------------------
+    # 4.1 提取并清洗相机参数 (防止单一字符串被误拆为字母列表)
+    # ---------------------------------------------------------
+    n_envs = getattr(cfg.env, "n_envs", 1)
+    render_cams = getattr(cfg.env, "render_camera", [])
+    
+    # 安全处理：如果是纯字符串 "top"，转换为 ["top"]；如果是列表则保持；None 则设为空列表
+    if render_cams is None:
+        render_cams = []
+    elif isinstance(render_cams, str):
+        render_cams = [render_cams]
+    else:
+        render_cams = list(render_cams)
+        
+    # 合并训练视角与渲染视角，并利用字典去重 (保留原始顺序)
+    obs_cameras = list(dict.fromkeys(ref_cams + render_cams))
+    logging.info(f"📷 最终绑定的环境相机视角: {obs_cameras}")
+
+    # ---------------------------------------------------------
+    # 4.2 启动 Gym 物理环境
+    # ---------------------------------------------------------
     if n_envs > 1:
-        # 使用 AsyncVectorEnv 自动拉起多个进程
+        # 使用 AsyncVectorEnv 自动拉起多个进程 
+        # 🌟 优化：使用 lambda 延迟初始化，保证每个进程拿到的都是绝对独立的环境实例
         env = gym.vector.AsyncVectorEnv(
-            [make_env_fn for _ in range(n_envs)],
-            shared_memory=True,  # 👈 开启官方内置的共享内存优化，防止传图像时卡顿！
-            context="spawn"  # 👈 强制安全启动子进程，防止 OpenGL/CUDA 崩溃
-            )
-        logging.info(f"✅成功启动 {n_envs} 个并行多进程环境...")
+            [lambda: gym.make(id=env_id, cameras=obs_cameras) for _ in range(n_envs)],
+            shared_memory=True,  # 👈 开启官方内置的共享内存优化，防止传图像时卡顿
+            context="spawn"      # 👈 强制安全启动子进程，防止 OpenGL/CUDA 崩溃
+        )
+        logging.info(f"✅ 成功启动 {n_envs} 个并行多进程环境 (AsyncVectorEnv) ...")
     else:
         env = gym.make(id=env_id, cameras=obs_cameras)
-        logging.info(f"✅成功启动单环境模式...")
+        logging.info("✅ 成功启动单环境模式...")
 
-    # 3. 初始化 Critic，传入真实的 state_dim
+    # ---------------------------------------------------------
+    # 4.3 初始化 Critic 网络
+    # ---------------------------------------------------------
     critic = ImageCritic(
-        camera_names=ref_cams,
-        state_dim=state_dim  # 👈 强制替换掉硬编码的 21
+        camera_names=ref_cams, # 注意：网络输入只需要 ref_cams，不需要 render_cams
+        state_dim=state_dim    # 👈 传入前面动态提取的真实状态维度
     ).to(device)
+    
+    logging.info("✅ 成功初始化 Critic 网络！")
 
     # ==========================================
-    # 3. 初始化优化器与超参数 (对应原版 init)
+    # 5. 初始化优化器与超参数
     # ==========================================
     actor_optimizer = torch.optim.AdamW(actor.parameters(), lr=cfg.training.actor_lr)
     critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=cfg.training.critic_lr)
-    print("Scheduler Type:", actor.config.noise_scheduler_type)
-    print("Prediction Type:", actor.config.prediction_type)
+    logging.info(f"⚙️ 扩散模型调度器类型 (Scheduler Type): {actor.config.noise_scheduler_type}")
+    logging.info(f"⚙️ 预测目标类型 (Prediction Type): {actor.config.prediction_type}")
     # 从配置中提取 RL 收集参数 (提供后备默认值)
     n_steps = getattr(cfg.training, "rollout_steps", 256)   # 每次更新前收集的步数
     act_steps = getattr(cfg.policy, "n_action_steps", 8) 
     denoising_steps = getattr(cfg.policy, "ft_denoising_steps", 10)
+
+    # 在进入训练循环前，仅全局重置一次环境，保证后续 MDP (马尔可夫决策过程) 的连续性
+    prev_obs, _ = env.reset()
+    # 记录当前每个环境正在跑的回合的累计分数
+    running_ep_rewards = np.zeros(n_envs, dtype=np.float32)
     # ==========================================
     # 🌟 主循环：DPPO 强化学习全流程
     # ==========================================
@@ -302,9 +333,6 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         # ==========================================
         # 1. 初始化 DPPO Rollout 缓冲区 (Buffers)
         # ==========================================
-        # 首次重置环境获取结构
-        prev_obs, _ = env.reset()
-        
         # 预分配轨迹内存，k对应相机/状态,v对应数据形状
         obs_trajs = {
             k: np.zeros((n_steps, n_envs, *v.shape), dtype=np.float32)
@@ -320,14 +348,12 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         
         reward_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
         terminated_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
-
-        # ==========================================
-        # 4. 开始收集环境交互数据 (Rollout Loop)
-        # ==========================================
-        logging.info(f"🏃 开始进入数据收集循环 (共 {n_steps} 步)...")
-        running_ep_rewards = np.zeros(n_envs, dtype=np.float32)  # 记录当前每个环境正在跑的回合的累计分数
         completed_ep_rewards = []                                # 存放所有【已经跑完】的回合的总分
         completed_ep_successes = []                              # 存放成功标志 (假设环境 info 里有 success 信息)
+        # ==========================================
+        # 2. 开始收集环境交互数据 (Rollout Loop)
+        # ==========================================
+        logging.info(f"🏃 开始进入数据收集循环 (共 {n_steps} 步)...")
         for step in range(n_steps):
             if step > 0 and step % 10 == 0:
                 logging.info(f"  > 已收集 {step}/{n_steps} 步...")
@@ -361,11 +387,13 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             action_venv = output_venv[:, :act_steps]
 
             # ==========================================
-            # 🌟 手动展开动作序列块 (Chunking Loop)
+            # 3. 手动展开动作序列块 (Chunking Loop)
             # 网络一次预测了 8 步，我们必须让物理环境分 8 次真实执行
             # ==========================================
             chunk_reward = np.zeros(n_envs, dtype=np.float32)
-            done_venv_accum = np.zeros(n_envs, dtype=bool)
+            # 🌟 修复 1：区分 "任何结束" 和 "真实终止"
+            any_done_accum = np.zeros(n_envs, dtype=bool)   # 用于停止累加当前块的奖励
+            true_term_accum = np.zeros(n_envs, dtype=bool)  # 用于告诉 GAE 抹除未来价值 (V=0)
 
             for step_i in range(act_steps):
                 # 1. 提取当前这一小步的动作，形状变为: [n_envs, action_dim]
@@ -386,44 +414,32 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 # 3. 极其重要的细节：计算掩码 (Mask)
                 # 如果某个并行环境在第 3 步就已经 done 了，Gym 会在底层自动复活它。
                 # 为了防止网络误把后续第 4-8 步的动作算进新任务的奖励里，我们需要掩蔽已结束的环境。
-                active_mask = ~done_venv_accum
+                active_mask = ~any_done_accum
                 chunk_reward += reward_venv * active_mask
                 
-                # 更新累积的终止状态
-                done_venv_accum = done_venv_accum | terminated_venv | truncated_venv
+                # 只有在 active 的状态下发生 terminated，才算是真实的死亡/通关
+                true_term_accum = true_term_accum | (terminated_venv & active_mask)
                 
                 # 4. 单环境的特殊处理：如果跑完了，必须手动重置并强行跳出当前 Chunk
-                if n_envs == 1 and done_venv_accum[0]:
+                if n_envs == 1 and any_done_accum[0]:
                     obs_venv, _ = env.reset()
                     break
-            # 🌟 核心替代逻辑：在循环内部顺手统计
-            # 1. 累加当前步的奖励
-            running_ep_rewards += chunk_reward
-            
-            # 2. 检查哪些环境结束了
-            for env_idx in range(n_envs):
-                if done_venv_accum[env_idx]:
-                    # 记录跑完的回合总分
-                    completed_ep_rewards.append(running_ep_rewards[env_idx])
-                    
-                    # 如果你的环境会返回成功与否，也可以记录
-                    # is_success = info_venv[env_idx].get("is_success", False)
-                    # completed_ep_successes.append(is_success)
-                    
-                    # 清零这个环境的累计器，准备迎接它的下一个新回合
-                    running_ep_rewards[env_idx] = 0.0
-            # 循环结束：将这 8 步累积的完整奖励和结束标志，交给外部的 PPO 缓冲区
-            reward_venv = chunk_reward
-            # =========================================================
 
-            # 4. 写入轨迹 Buffer
+            # 4. 顺手统计回合总奖励 (用于日志打印)
+            running_ep_rewards += chunk_reward
+            for env_idx in range(n_envs):
+                if any_done_accum[env_idx]:
+                    completed_ep_rewards.append(running_ep_rewards[env_idx])
+                    running_ep_rewards[env_idx] = 0.0
+            
+            # 5. 写入轨迹 Buffer，将这 8 步累积的完整奖励和结束标志，交给外部的 PPO 缓冲区
             for k in obs_trajs:
                 # 写入执行动作前的观测
                 obs_trajs[k][step] = prev_obs[k] if n_envs > 1 else np.expand_dims(prev_obs[k], 0)
                 
             chains_trajs[step] = chains_venv            # [n_steps, n_envs, denoising_steps + 1, horizon_steps, action_dim]
-            reward_trajs[step] = reward_venv            # [n_steps, n_envs]
-            terminated_trajs[step] = terminated_venv    # [n_steps, n_envs]
+            reward_trajs[step] = chunk_reward            # [n_steps, n_envs]
+            terminated_trajs[step] = true_term_accum    # [n_steps, n_envs]
 
             # 5. 状态流转
             prev_obs = obs_venv

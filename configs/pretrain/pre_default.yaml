@@ -6,10 +6,11 @@ defaults:
 
 hydra:
   run:
-    dir: outputs/pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.name}_${policy.name}_${hydra.job.name}
+    dir: outputs/pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
+    # ${hydra.runtime.choices.policy}就是对应的policy名称，如果直接写${policy}会把文件里的参数都放进去
     # dir: src/av-aloha/DPPO/outputs/pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.name}_${policy.name}_${hydra.job.name}
   job:
-    name: pretrain_zed_diffusion_${now:%Y-%m-%d}_${now:%H-%M-%S}
+    name: ${env.task}_${hydra.runtime.choices.policy}_${now:%Y-%m-%d}_${now:%H-%M-%S}
 
 # 将 `resume` 设置为 true 以恢复之前的运行。为此，您需要确保hydra.run.dir是至少包含一个检查点的现有运行目录。
 # 注意，当恢复运行时，默认行为是使用检查点中的配置，无论恢复时训练命令提供了什么参数。。
@@ -118,6 +119,6 @@ wandb:
   enable: true
   # Set to true to disable saving an artifact despite save_checkpoint == True
   disable_artifact: true # 不保存artifact，即不上传权重模型
-  project: pretrain #项目名称
+  project: ${env.task}_finetune #项目名称
   notes: ""
   save_code: false  # 是否保存代码

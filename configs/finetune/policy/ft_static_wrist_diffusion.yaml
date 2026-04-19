@@ -3,12 +3,10 @@
 # 可以使用命令行python finetune/train_finetune.py --cfg job进行查看
 seed: 1000
 dataset_repo_id : "dppo_online_rollout"  # lerobot底层的logger需要这个进行分组，不写会报错
-hydra:
-  job:
-    name: ft_zed_diffusion_${now:%Y-%m-%d}_${now:%H-%M-%S}
 
 env:
-  name : SewNeedle-2Arms-v0
+  name : sim_envs
+  task : SewNeedle-2Arms-v0
   n_envs: 2                            # 并行环境数量
   render_camera : ['overhead_cam']     # 评估时保存的video视角相机
 
@@ -36,11 +34,7 @@ eval:
   eval_freq: 500               # 强化学习微调容易崩溃，需要高频评估
   n_episodes: 5
   fps: 25
-  reference_cameras: ['zed_cam_left', 'zed_cam_right']
   render_camera: ['overhead_cam']
-
-wandb:
-  project: ${env.name}_finetune
 
 policy:
   name: diffusion

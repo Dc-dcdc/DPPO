@@ -1,48 +1,76 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
+import torchvision.transforms as T
+import numpy as np
 
 class ImageCritic(nn.Module):
     def __init__(self, camera_names, state_dim=21, hidden_dim=256):
         super().__init__()
         self.camera_names = camera_names
         
-        # 1. 为每个相机创建一个轻量级的视觉编码器 (这里用 ResNet18 的特征层)
+        # 🌟 优化 1: 强烈建议使用预训练权重！
+        # 在 RL 中从头训 ResNet 极难收敛。使用 ImageNet 预训练特征能将训练速度提升数倍。
         self.visual_encoders = nn.ModuleDict()
         for cam in camera_names:
-            resnet = models.resnet18(weights=None) # 微调时通常从头训 Critic 或冻结预训练特征
-            # 去掉最后的全连接层，输出维度为 512
+            # 引入 ImageNet 默认权重 不使用优化权重则设置weights=none
+            resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT) 
             self.visual_encoders[cam] = nn.Sequential(*list(resnet.children())[:-1])
             
-        # 2. 状态编码器
-        self.state_encoder = nn.Linear(state_dim, hidden_dim)
+        # 🌟 优化 2: 匹配预训练权重的标准归一化
+        # 因为前置代码你只除以了 255.0，这里补上 ImageNet 期望的 Mean 和 Std
+        self.normalize = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            
+        # 🌟 优化 3: 为状态特征添加 LayerNorm
+        # 图像特征是 512*相机数 维，状态特征只有 hidden_dim 维。
+        # 加上 LayerNorm 防止数值较小的 State 特征被庞大的视觉特征“淹没”
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU()
+        )
         
-        # 3. 融合后的全连接层 (输出一个标量 Value)
-        # 输入维度: len(cameras) * 512 (图像特征) + hidden_dim (状态特征)
+        # 融合后的全连接层
         total_feature_dim = len(camera_names) * 512 + hidden_dim
         self.mlp = nn.Sequential(
             nn.Linear(total_feature_dim, 512),
+            nn.LayerNorm(512), # 加入 LayerNorm 稳定 PPO 训练的高级技巧
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(256, 1) # 🌟 Critic 的核心：输出唯一的价值评估
+            nn.Linear(256, 1)
         )
+        
+        # 🌟 优化 4: PPO 祖传秘方 —— 正交初始化
+        self._apply_orthogonal_init()
+
+    def _apply_orthogonal_init(self):
+        """对 MLP 层应用正交初始化，并在最后一层将权重极度缩小"""
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.constant_(m.bias, 0.0)
+        # 🌟 极其关键：最后一层 Gain 设为 0.01，确保初始 V(s) 接近 0。
+        # 这样第一轮更新时的 Advantage 才不会因为 Critic 的瞎猜而爆炸。
+        nn.init.orthogonal_(self.mlp[-1].weight, gain=0.01)
 
     def forward(self, batch):
-        """
-        接收与 Actor 相同的 batch 字典输入
-        """
         features = []
         
         # 提取图像特征
         for cam in self.camera_names:
-            img_tensor = batch[f'observation.images.{cam}'] # [BS, C, H, W]
-            # ResNet 输出是 [BS, 512, 1, 1]，压平为 [BS, 512]
-            feat = self.visual_encoders[cam](img_tensor).squeeze(-1).squeeze(-1)
+            img_tensor = batch[f'observation.images.{cam}'] # 期望输入: [BS, C, H, W], 数值域 0.0~1.0
+            
+            # 应用标准化
+            img_tensor = self.normalize(img_tensor)
+            
+            # 🌟 优化 5: 用 flatten 替代连续的 squeeze
+            # ResNet 输出 [BS, 512, 1, 1]。flatten(start_dim=1) 更安全、鲁棒。
+            feat = self.visual_encoders[cam](img_tensor).flatten(start_dim=1)
             features.append(feat)
             
         # 提取状态特征
-        state_tensor = batch['observation.state'] # [BS, 21]
+        state_tensor = batch['observation.state'] # [BS, StateDim]
         state_feat = self.state_encoder(state_tensor)
         features.append(state_feat)
         
@@ -51,4 +79,5 @@ class ImageCritic(nn.Module):
         
         # 计算价值 V(s)
         value = self.mlp(concat_features) # [BS, 1]
+        
         return value.squeeze(-1) # 返回 [BS]

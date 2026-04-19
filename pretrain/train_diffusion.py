@@ -543,9 +543,9 @@ if __name__ == "__main__":
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
         "env=sim_sew_needle_2arms", # 环境，这俩定义在default文件中
-        "policy=pre_static_wrist_diffusion", # 策略
+        "policy=pre_static_diffusion", # 策略
         "resume=false",
-        "resume_path=outputs/pretrain/train/2026-04-14/20-59-47_guided_vision_diffusion_pretrain_zed_diffusion_2026-04-14_20-59-47/checkpoints/335000",
+        "resume_path=outputs/pretrain/train/2026-04-16/10-11-10_sim_envs_diffusion_pretrain_zed_diffusion_2026-04-16_10-11-10/checkpoints/0125000",
         "training.batch_size=16",
         "training.num_workers=4",
         "wandb.enable=true" ,

@@ -2,9 +2,7 @@
 
 seed: 1000
 
-hydra:
-  job:
-    name: pretrain_zed_diffusion_${now:%Y-%m-%d}_${now:%H-%M-%S}
+
 
 override_dataset_stats:
   observation.images.overhead_cam:

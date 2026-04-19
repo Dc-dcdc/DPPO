@@ -2,9 +2,6 @@
 
 seed: 1000
 
-hydra:
-  job:
-    name: pretrain_zed_diffusion_${now:%Y-%m-%d}_${now:%H-%M-%S}
 
 override_dataset_stats:
   observation.images.overhead_cam:
@@ -42,7 +39,7 @@ training:
     observation.images.worms_eye_cam: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
 
 eval:
-  eval_freq: 100
+  eval_freq: 5000
   batch_size: 1
   n_episodes: 4              # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 4   # 最多保存前几个 episode 的录像视频
