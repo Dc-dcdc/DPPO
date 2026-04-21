@@ -2,11 +2,98 @@ import torch
 import logging
 import numpy as np
 import imageio
+import json
+import shutil
 from pathlib import Path
 from contextlib import nullcontext
 import gymnasium as gym
 import yaml
 from pathlib import Path
+
+# ==========================================
+# 🌟 [新增] 自定义 Top-K 快照管理器(包含视频同步清理)
+# ==========================================
+class TopKCheckpointManager:
+    """
+    核心逻辑：
+    1. 维护一个大小为 max_keep 的列表，按 loss 从小到大排序。
+    2. 永远保留最新的 checkpoint（防止训练中断后无法续训最近的进度）。
+    3. 自动扫描并删除既不在 top_k 列表，也不是 latest 的多余权重文件夹。
+    """
+    def __init__(self, out_dir: str, max_keep: int = 5, records_resume: bool = True):
+        self.out_dir = Path(out_dir) if out_dir else Path("outputs")
+        self.checkpoints_dir = self.out_dir / "checkpoints"  # 模型快照存放的总目录 
+        self.eval_dir = self.out_dir / "eval"  # 评估视频存放的总目录
+        self.max_keep = max_keep
+        self.top_k = [] # 数据结构: [{"step": int, "loss": float, "path": Path}]
+        self.latest_path = None
+        self.records_file = self.checkpoints_dir / "top_k_records.json"
+        self.records_resume = records_resume
+        # 支持断点续训：每次实例化时从本地读取记录，保证跨 step 调用时不丢失历史信息
+        if self.records_file.exists() and self.records_resume:
+            try:
+                with open(self.records_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self.latest_path = Path(data.get("latest")) if data.get("latest") else None
+                    self.top_k = [
+                        {"step": item["step"], "loss": item["loss"], "path": Path(item["path"])} 
+                        for item in data.get("top_k", [])
+                    ]
+            except Exception as e:
+                logging.warning(f"⚠️ 无法读取 Top-K 记录，将重新开始统计: {e}")
+
+    def update(self, step: int, loss: float, ckpt_path: Path):
+        self.latest_path = ckpt_path
+        # 防重入：如果当前路径已经在记录里了，先剔除旧的
+        self.top_k = [item for item in self.top_k if item["path"].name != ckpt_path.name]
+        # 将新的 checkpoint 加入 top-k 候选并排序
+        self.top_k.append({"step": step, "loss": loss, "path": ckpt_path})
+        self.top_k.sort(key=lambda x: x["loss"]) # loss 越小越好，排在前面
+        
+        # 如果超出了保留数量，把表现最差的剔除（仅仅是从内存列表中剔除）
+        if len(self.top_k) > self.max_keep:
+            self.top_k.pop(-1) 
+            logging.info(f"🛡️ 候选列表完成 ({len(self.top_k)}/{self.max_keep})，去除loss最大的模型快照。")
+        else:
+            logging.info(f"🛡️ 候选列表还在收集中 ({len(self.top_k)}/{self.max_keep})，暂不执行硬盘清理。")
+        if self.checkpoints_dir.exists():
+            # 提取出合法的【文件夹名称】集合
+            valid_names = {item["path"].name for item in self.top_k}
+            if self.latest_path:
+                valid_names.add(self.latest_path.name) # 最新模型必须保存
+
+            for d in self.checkpoints_dir.iterdir():
+                if d.is_dir() and d.name.split('_')[0].isdigit():
+                    if d.name not in valid_names:
+                        shutil.rmtree(d, ignore_errors=True)
+                        logging.info(f"🗑️ 已清理未进入 Top-{self.max_keep} 的模型快照: {d.name}")
+            
+        
+        # 2. 同步清理物理硬盘上的无用评估视频文件夹
+        if self.eval_dir.exists():
+            # 基于 valid_names 生成合法的视频文件夹名称
+            valid_video_folder_names = {f"videos_{name}" for name in valid_names}
+            
+            for v_dir in self.eval_dir.iterdir():
+                # 只清理以 "videos_" 开头，且后缀是数字（或带 loss 的数字）的文件夹
+                if v_dir.is_dir() and v_dir.name.startswith("videos_"):
+                    # 提取 videos_ 后面的部分判断是不是我们的目标文件夹
+                    suffix = v_dir.name.replace("videos_", "")
+                    if suffix.split('_')[0].isdigit():
+                        if v_dir.name not in valid_video_folder_names:
+                            shutil.rmtree(v_dir, ignore_errors=True)
+                            logging.info(f"🗑️ 已同步清理失效模型的评估视频: {v_dir.name}")
+                            
+        self._save_records()
+
+    def _save_records(self):
+        self.checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.records_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "latest": str(self.latest_path) if self.latest_path else None,
+                "top_k": [{"step": i["step"], "loss": i["loss"], "path": str(i["path"])} for i in self.top_k]
+            }, f, indent=4, ensure_ascii=False)
+
 def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     """
     完全自主实现的评估代码。没有任何黑盒。
@@ -16,6 +103,9 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     successes = []
     rewards = []
 
+    # 用来动态记录实际保存的视频路径
+    saved_video_paths = []
+    
     videos_dir = Path(videos_dir)
     videos_dir.mkdir(parents=True, exist_ok=True)
     
@@ -24,7 +114,9 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     max_rendered = getattr(cfg_eval, "max_episodes_rendered", 4)
     fps = getattr(cfg_eval, "fps", 25)
     max_steps = getattr(cfg_eval, "max_steps", 300)
-    render_camera = getattr(cfg_eval, "render_camera", 'overhead_cam')
+    raw_camera = getattr(cfg_eval, "render_camera", 'overhead_cam')
+    #适配字符串和列表，即['overhead_cam']和'overhead_cam'
+    render_camera = raw_camera[0] if isinstance(raw_camera, (list, tuple)) else raw_camera 
     # 动作执行循环
     for ep in range(n_episodes):
         obs, _ = env.reset()
@@ -75,9 +167,13 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
 
         # 6. 根据配置的帧率和最大渲染数量保存视频
         if ep < max_rendered and len(frames) > 0:
-            video_path = videos_dir / f"eval_{render_camera[0]}_{ep}.mp4"
+            # 格式：012500_reward=150.5_cam_overhead_ep_0.mp4
+            video_name = f"cam_{render_camera[0]}_ep_{ep}_reward={ep_reward:.1f}.mp4"
+            video_path = videos_dir / video_name
             imageio.mimsave(str(video_path), frames, fps=fps)
-            logging.info(f"🎥 保存视频: {video_path}")
+            logging.info(f"🎥 保存视频: {video_path.name}")
+            
+            saved_video_paths.append(str(video_path))
 
     policy.train() # 恢复训练模式
     
@@ -88,12 +184,12 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
             "success_rate": float(np.mean(successes)),
             "average_reward": float(np.mean(rewards))
         },
-        "video_paths": [str(videos_dir / f"eval_{render_camera[0]}_{i}.mp4") for i in range(actual_rendered)]
+        "video_paths": saved_video_paths
     }
 
 
 def evaluate_and_checkpoint_if_needed(
-    step, policy, optimizer, lr_scheduler, logger, cfg, device, out_dir, eval_env=None
+    step, policy, optimizer, lr_scheduler, logger, cfg, device, out_dir, eval_env=None, train_loss=None, manager=None
 ):
     """
     主评估与保存入口
@@ -101,13 +197,19 @@ def evaluate_and_checkpoint_if_needed(
     _num_digits = max(6, len(str(cfg.training.offline_steps))) 
     step_identifier = f"{step:0{_num_digits}d}" 
 
+    if train_loss is not None:
+        folder_identifier = f"{step_identifier}_loss={train_loss:.4f}"
+    else:
+        folder_identifier = step_identifier
+    
     # 1. 评估逻辑 (优先读取 cfg.eval.eval_freq)
     eval_freq = getattr(cfg.eval, "eval_freq", 0)
+    is_last_step = (step == cfg.training.offline_steps - 1)
     
-    if eval_freq > 0 and step > 0 and step % eval_freq == 0:
+    if (eval_freq > 0 and step > 0 and step % eval_freq == 0) or is_last_step:
         logging.info(f"📊 开始自主评估流程, 当前 Step: {step}")
         if eval_env is not None:
-            video_dir = Path(out_dir) / "eval" / f"videos_step_{step_identifier}"
+            video_dir = Path(out_dir) / "eval" / f"videos_{folder_identifier}"
             
             with torch.autocast(device_type=device.type) if cfg.use_amp else nullcontext():
                 # 传入完整的 cfg.eval 节点
@@ -126,13 +228,21 @@ def evaluate_and_checkpoint_if_needed(
             if getattr(cfg, "wandb", {}).get("enable", False) and len(eval_info["video_paths"]) > 0:
                 logger.log_video(eval_info["video_paths"][0], step, mode="eval") # 只上传第一个视频到 wandb
 
-    # 2. 保存检查点逻辑
-    is_last_step = (step == cfg.training.offline_steps - 1)
     save_freq = getattr(cfg.training, "save_freq", 10000)
     if getattr(cfg.training, "save_checkpoint", False) and (step > 0 and step % save_freq == 0 or is_last_step):
         logging.info(f"💾 保存模型快照... Step: {step}")
-        logger.save_checkpoint(step, policy, optimizer, lr_scheduler, identifier=step_identifier)
+        logger.save_checkpoint(step, policy, optimizer, lr_scheduler, identifier=folder_identifier)
 
+        # ==========================================
+        # 触发 Top-K 筛选与清理
+        # ==========================================
+        if train_loss is not None:
+            
+            ckpt_path = Path(out_dir) / "checkpoints" / folder_identifier
+            if ckpt_path.exists():
+                manager.update(step, train_loss, ckpt_path)
+        else:
+            logging.warning("⚠️ 警告: 未传入 train_loss，跳过 Top-K 模型清理逻辑，将保留所有权重。")
 
 # =========================================================================
 # 🌟 独立评估测试入口，推荐使用lerobot保存的快照格式，只需要给路径，环境配置会自动对齐
@@ -154,7 +264,7 @@ if __name__ == "__main__":
     # 🎯 核心配置区：在这里自由修改你的评估参数！
     # ==========================================
     eval_cfg = SimpleNamespace(
-        # 📂 模型路径设置 (直接指向 000000 这样的数字文件夹即可，代码会自动寻找内部结构)
+        # 📂 模型路径设置 (直接指向 0000600_loss=0.1540 文件夹即可，代码会自动寻找内部结构)
         ckpt_path="outputs/pretrain/train/2026-04-15/22-11-55_sim_envs_diffusion_pretrain_zed_diffusion_2026-04-15_22-11-55/checkpoints/0620000",
         name = 'sim_envs', #会自动加载，可以不改
         task = 'SewNeedle-3Arms-v0', #会自动加载，可以不改

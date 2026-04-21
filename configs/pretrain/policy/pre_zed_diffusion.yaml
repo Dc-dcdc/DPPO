@@ -22,9 +22,8 @@ training:
   save_freq: 5000 # 每 5000 步保存一次模型快照
   log_freq: 100
   save_checkpoint: true
-  
   num_workers: 4   # Number of workers for the offline training dataloader.
-  batch_size: 4
+  batch_size: 16
   lr: 1e-4 # 学习率
   weight_decay: 1e-4 # L2正则化
   grad_clip_norm: 10 # 梯度裁剪
@@ -42,15 +41,14 @@ training:
 eval:
   eval_freq: 100
   batch_size: 1
-  n_episodes: 4              # 每次评估跑多少个完整的 episode
+  n_episodes: 10             # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 4   # 最多保存前几个 episode 的录像视频
-  fps: 25                    # 录制的 MP4 视频帧率
   max_steps: 300             # 环境的单局最大步数截断
   reference_cameras : ['zed_cam_left', 'zed_cam_right']   #模型推理要用的相机图像（条件输入），需要与input_shapes中的相机名称一致
   render_camera : ['overhead_cam']                           # 评估时保存的video视角相机
   # cameras : ['zed_cam_left', 'zed_cam_right', 'overhead_cam'] # 选择读取仿真环境中对应的相机，即环境中的观测obs
 
-# See `configuration_act.py` for more details.
+
 policy:
   name: diffusion
   # ==========================================

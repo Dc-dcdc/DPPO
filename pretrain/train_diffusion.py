@@ -7,12 +7,14 @@ from env.sim_envs import SewNeedleEnv
 import logging
 import time
 import sys
+import json    # 用于保存 Top-K 的历史记录文件
+import shutil  # 用于删除多余的模型文件夹
 from contextlib import nullcontext
 from pathlib import Path
 from pprint import pformat
-from itertools import cycle  # 🌟 使用 Python 原生的循环迭代器，更轻量
+from itertools import cycle  #  使用 Python 原生的循环迭代器，更轻量
 
-from eval import  evaluate_and_checkpoint_if_needed
+from eval import  evaluate_and_checkpoint_if_needed,TopKCheckpointManager
 
 import hydra
 import torch
@@ -180,8 +182,6 @@ def update_policy(
             info[k] = v
 
     return info
-
-
 
 
 
@@ -422,13 +422,15 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 logging.info(f"⏭️ 从字典成功读取，训练将从 step {start_step} 无缝继续...")
             else:
                 # 容错：如果字典里真没存步数，就退化为看文件夹的名字 (比如 000500)
-                start_step = int(chkpt_dir.name) + 1
+                # 提取下划线前的纯数字部分再转换
+                start_step = int(chkpt_dir.name.split('_')[0]) + 1
                 logging.info(f"⏭️ 字典中未记录步数，从目录名推断，训练将从 step {start_step} 无缝继续...")
 
         except Exception as e:
             logging.error(f"❌ 解析 {training_state_file.name} 失败: {e}")
             try:
-                start_step = int(chkpt_dir.name) + 1
+                # 提取下划线前的纯数字部分再转换
+                start_step = int(chkpt_dir.name.split('_')[0]) + 1
                 logging.info(f"⏭️ 降级方案：从目录名推断，训练将从 step {start_step} 无缝继续...")
             except ValueError:
                 pass
@@ -481,6 +483,9 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # ==========================================
     # 🌟 6. DPPO 预训练主循环
     # ==========================================
+    max_checkpoints = getattr(cfg.training, "max_checkpoints", 5)
+    records_resume = getattr(cfg.eval, "records_resume", True)
+    manager = TopKCheckpointManager(out_dir=out_dir, max_keep=max_checkpoints, records_resume=records_resume)
     policy.train()
     logging.info("🔥 开始 DPPO 预训练 (模仿学习阶段)...")
     
@@ -524,6 +529,8 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
             device=device,
             out_dir=out_dir,
             eval_env=eval_env,        # 预训练阶段如果没有验证环境，直接传 None
+            train_loss=train_info["loss"],
+            manager=manager,
         )
     logging.info("🎉 DPPO 预训练圆满结束！你现在可以拿着这个 Checkpoint 去跑 PPO 微调了。")
 
@@ -531,7 +538,8 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
 # 🌟 Hydra 启动入口 (保留配置功能与 Args 注入)
 # ==========================================
 @hydra.main(version_base="1.2", config_name="pre_default", config_path="../configs/pretrain") #配置文件存放位置
-def train_cli(cfg: DictConfig):          
+def train_cli(cfg: DictConfig):
+
     train_dppo_pretrain(
         cfg,
         out_dir=hydra.core.hydra_config.HydraConfig.get().run.dir,  # 获取当前训练运行的输出目录，用于保存训练输出的数据
@@ -544,11 +552,11 @@ if __name__ == "__main__":
     default_args = [
         "env=sim_sew_needle_2arms", # 环境，这俩定义在default文件中
         "policy=pre_static_diffusion", # 策略
-        "resume=false",
-        "resume_path=outputs/pretrain/train/2026-04-16/10-11-10_sim_envs_diffusion_pretrain_zed_diffusion_2026-04-16_10-11-10/checkpoints/0125000",
-        "training.batch_size=16",
+        "resume=true",
+        "resume_path=outputs/pretrain/train/2026-04-22/10-59-57_SewNeedle-2Arms-v0_pre_static_diffusion/checkpoints/last",
+        "training.batch_size=32",
         "training.num_workers=4",
-        "wandb.enable=true" ,
+        "wandb.enable=FaLse" ,
     ]
     
     for arg in default_args:
@@ -556,4 +564,24 @@ if __name__ == "__main__":
         if not any(arg_key in sys_arg for sys_arg in sys.argv):
             sys.argv.append(arg)
 
+    # ==========================================
+    # 🌟 核心修复：在 Hydra 启动前截胡！强行修改底层输出目录
+    # ==========================================
+    # 使用 replace(" ", "") 过滤掉所有可能的空格干扰
+    is_resume = any(arg.lower().replace(" ", "") == "resume=true" for arg in sys.argv)
+    resume_path_arg = next((arg for arg in sys.argv if arg.startswith("resume_path=")), None)
+
+    if is_resume and resume_path_arg:
+        resume_path = resume_path_arg.split("=", 1)[1].strip("'\"")
+        
+        # 只要路径有效，就强行重定向
+        if resume_path.lower() not in ["none", "null", ""]:
+            ckpt_path = Path(resume_path)
+            # checkpoints/last 的上一级的上一级，就是原本的训练根目录
+            original_out_dir = str(ckpt_path.parent.parent.absolute())
+            
+            # 告诉 Hydra：不要建新文件夹了，日志、配置、视频统统给我存进这个老目录！
+            sys.argv.append(f'hydra.run.dir="{original_out_dir}"')
+            print(f"🔄 [预处理] 检测到断点续训，已强制重定向所有输出至旧目录:\n   👉 {original_out_dir}")
+    
     train_cli()

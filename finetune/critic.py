@@ -24,14 +24,18 @@ class ImageCritic(nn.Module):
         # 🌟 优化 3: 为状态特征添加 LayerNorm
         # 图像特征是 512*相机数 维，状态特征只有 hidden_dim 维。
         # 加上 LayerNorm 防止数值较小的 State 特征被庞大的视觉特征“淹没”
-        self.state_encoder = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU()
-        )
-        
-        # 融合后的全连接层
-        total_feature_dim = len(camera_names) * 512 + hidden_dim
+        self.state_dim = state_dim
+        if self.state_dim is not None: # 如果状态特征不为空
+            self.state_encoder = nn.Sequential(
+                nn.Linear(state_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU()
+            )
+            total_feature_dim = len(camera_names) * 512 + hidden_dim
+        else:
+            self.state_encoder = None
+            total_feature_dim = len(camera_names) * 512
+
         self.mlp = nn.Sequential(
             nn.Linear(total_feature_dim, 512),
             nn.LayerNorm(512), # 加入 LayerNorm 稳定 PPO 训练的高级技巧
@@ -70,9 +74,10 @@ class ImageCritic(nn.Module):
             features.append(feat)
             
         # 提取状态特征
-        state_tensor = batch['observation.state'] # [BS, StateDim]
-        state_feat = self.state_encoder(state_tensor)
-        features.append(state_feat)
+        if self.state_dim is not None:
+            state_tensor = batch['observation.state'] 
+            state_feat = self.state_encoder(state_tensor)
+            features.append(state_feat)
         
         # 拼接所有特征
         concat_features = torch.cat(features, dim=-1)

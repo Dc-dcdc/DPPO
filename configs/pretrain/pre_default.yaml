@@ -30,48 +30,21 @@ seed: ???
 dataset_repo_id: lerobot/pusht
 video_backend: pyav
 
+eval:
+  n_episodes: 1
+  # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
+  batch_size: 1
+  # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
+  use_async_envs: true
+  records_resume: true  # 是否读取top-k的快照和视频列表 即top_k_records.json
+  fps: 25                    # 录制的 MP4 视频帧率
+  
 training:
   eval_freq: ???
-  log_freq: 200
-  save_checkpoint: true
-  # Checkpoint is saved every `save_freq` training iterations and after the last training step.
-  save_freq: ???
+  log_freq: 100 # 多少步记录一次日志，会在终端输出，并上传wandb
+  save_checkpoint: true 
+  max_checkpoints: 10  # 最多保存loss最小的几个模型快照
 
-  # Online training. Note that the online training loop adopts most of the options above apart from the
-  # dataloader options. Unless otherwise specified.
-  # The online training look looks something like:
-  #
-  # for i in range(online_steps):
-  #     do_online_rollout_and_update_online_buffer()
-  #     for j in range(online_steps_between_rollouts):
-  #         batch = next(dataloader_with_offline_and_online_data)
-  #         loss = policy(batch)
-  #         loss.backward()
-  #         optimizer.step()
-  #
-  online_steps: ???
-  # How many episodes to collect at once when we reach the online rollout part of the training loop.
-  online_rollout_n_episodes: 1
-  # The number of environments to use in the gym.vector.VectorEnv. This ends up also being the batch size for
-  # the policy. Ideally you should set this to by an even divisor or online_rollout_n_episodes.
-  online_rollout_batch_size: 1
-  # How many optimization steps (forward, backward, optimizer step) to do between running rollouts.
-  online_steps_between_rollouts: null
-  # The proportion of online samples (vs offline samples) to include in the online training batches.
-  online_sampling_ratio: 0.5
-  # First seed to use for the online rollout environment. Seeds for subsequent rollouts are incremented by 1.
-  online_env_seed: null
-  # Sets the maximum number of frames that are stored in the online buffer for online training. The buffer is
-  # FIFO.
-  online_buffer_capacity: null
-  # The minimum number of frames to have in the online buffer before commencing online training.
-  # If online_buffer_seed_size > online_rollout_n_episodes, the rollout will be run multiple times until the
-  # seed size condition is satisfied.
-  online_buffer_seed_size: 0
-  # Whether to run the online rollouts asynchronously. This means we can run the online training steps in
-  # parallel with the rollouts. This might be advised if your GPU has the bandwidth to handle training
-  # + eval + environment rendering simultaneously.
-  do_online_rollout_async: false
 
   image_transforms:
   # These transforms are all using standard torchvision.transforms.v2
@@ -108,12 +81,7 @@ training:
       weight: 1
       min_max: [0.8, 1.2]
 
-eval:
-  n_episodes: 1
-  # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
-  batch_size: 1
-  # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
-  use_async_envs: true
+
 
 wandb:
   enable: true

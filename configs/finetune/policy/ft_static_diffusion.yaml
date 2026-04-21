@@ -17,8 +17,8 @@ training:
   # RL 训练步数与频率
   n_train_itr: 10000          # 总迭代轮数，微调通常不需要跑太久
   rollout_steps: 100          # 每次收集多少步数据再去更新
-  batch_size: 50              # PPO 更新的 batch size
-  update_epochs: 10            # 收集完数据后，在这些数据上更新几轮网络  
+  batch_size: 24              # PPO 更新的 batch size
+  update_epochs: 5            # 收集完数据后，在这些数据上更新几轮网络  
 
   # 学习率 (微调时一定要极小，防止破坏预训练特征！)
   actor_lr: 1e-5               # Diffusion 网络的学习率

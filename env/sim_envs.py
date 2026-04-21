@@ -26,6 +26,7 @@ class GuidedVisionEnv(gym.Env):
     def __init__(self, 
             xml_path: str,
             num_arms: int = 3,
+            episode_length: int = 300,
             cameras: list[str] = CAMERAS,
             observation_height: int = 480,
             observation_width: int = 640,
@@ -44,7 +45,7 @@ class GuidedVisionEnv(gym.Env):
         self.cameras = cameras # 使用的摄像头列表
         assert num_arms in [2, 3], f"Invalid number of arms: {num_arms}"
         self.num_arms = num_arms
-
+        self.episode_length = episode_length
         self._middle_base_link = self._mjcf_root.find('body', MIDDLE_BASE_LINK)
         self._middle_base_link_init_pos = self._middle_base_link.pos.copy()
 
@@ -148,7 +149,8 @@ class GuidedVisionEnv(gym.Env):
     def reset(self, seed=None, options=None) -> tuple:
         super().reset(seed=seed)
         self._physics.reset()
-        
+        # 🌟 新增：重置回合内部的步数计数器
+        self._current_step = 0
         # 恢复默认位姿
         self._physics.bind(self._left_joints).qpos = LEFT_ARM_POSE 
         self._physics.bind(self._left_gripper_joints).qpos = self.left_gripper_unnorm_fn(1) # 夹爪张开到最大
@@ -170,7 +172,12 @@ class GuidedVisionEnv(gym.Env):
 
     def step(self, action: np.ndarray) -> tuple:
         """Gymnasium 标准步进函数"""
-        # 1. 动作拆包
+        # 1. 引擎防爆护盾 (拦截 NaN 和无穷大)
+        if np.isnan(action).any() or np.isinf(action).any():
+            print("⚠️ 警告：检测到非法动作 (NaN/Inf)，已启动安全降级为全 0 动作！")
+            action = np.zeros_like(action)
+        
+        # 2. 动作拆包
         left_joints = action[:6]
         left_gripper = np.clip(action[6], 0.0, 1.0) # 0.0 到 1.0 之间的归一化值
         right_joints = action[7:13]
@@ -179,29 +186,29 @@ class GuidedVisionEnv(gym.Env):
             middle_joints = action[14:21]
             self._physics.bind(self._middle_actuators).ctrl = middle_joints
 
-        # 2. 映射到物理引擎执行器
+        # 3. 映射到物理引擎执行器
         self._physics.bind(self._left_actuators[:6]).ctrl = left_joints
         self._physics.bind(self._right_actuators[:6]).ctrl = right_joints
 
         self._physics.bind(self._left_actuators[6]).ctrl = self.left_gripper_unnorm_fn(left_gripper)
         self._physics.bind(self._right_actuators[6]).ctrl = self.right_gripper_unnorm_fn(right_gripper)
 
-        # 3. 步进物理引擎
+        # 4. 步进物理引擎
         for _ in range(SIM_PHYSICS_ENV_STEP_RATIO): self._physics.step()
-        # self._physics.step(nstep=SIM_PHYSICS_ENV_STEP_RATIO)
-        
-        # 4. 获取观察与奖励
+        self._current_step += 1   # 步数追踪
+
+        # 5. 获取观察与奖励
         observation = self.get_obs()
         reward = self.get_reward() if hasattr(self, 'get_reward') else 0.0
         
-        # 5. 判断终止条件
+        # 6. 判断终止条件
         max_rwd = getattr(self, 'max_reward', -1)
-        terminated = (reward == max_rwd) # 达到最大奖励则任务成功结束
-        truncated = False
+        terminated = bool(reward >= max_rwd - 1e-4) # 达到最大奖励则任务成功结束
+        truncated = bool(self._current_step >= self.episode_length) # 超出最大步数
         
-        info = {"is_success": terminated, "reward": reward}
+        info = {"is_success": terminated, "reward": reward, "step": self._current_step}
 
-        return observation, reward, terminated, truncated, info
+        return observation, float(reward),  terminated, truncated, info
 
     def render(self,render_camera):
         """
