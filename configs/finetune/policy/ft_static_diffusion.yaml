@@ -28,7 +28,6 @@ training:
   gamma: 0.99                  # 奖励折扣因子
   gae_lambda: 0.95             # GAE 优势计算参数
   clip_ratio: 0.2              # PPO 截断范围
-  entropy_coef: 0.01           # 探索奖励 (原版 DPPO 会处理 Diffusion 的熵)
 
 eval:
   eval_freq: 1               # 评估频率

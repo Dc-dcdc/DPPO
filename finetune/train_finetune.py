@@ -198,11 +198,7 @@ def get_logprobs(self, cond: dict, x_t: torch.Tensor, x_t_1: torch.Tensor, times
     # 将概率在动作序列维度求和 (累乘转化为对数累加)
     log_prob = log_prob.flatten(start_dim=1).sum(dim=-1)
 
-    # 7. 计算高斯分布的香农熵 (用于 PPO 探索正则化)
-    action_dim_total = x_t.shape[1] * x_t.shape[2]
-    entropy = action_dim_total * (0.5 * math.log(2 * math.pi * math.e * var))
-
-    return log_prob, entropy
+    return log_prob
 
 def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
     """
@@ -363,6 +359,8 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     act_steps = getattr(cfg.policy, "n_action_steps", 8) 
     denoising_steps = getattr(cfg.policy, "ft_denoising_steps", 10)
     critic_warmup_iters = getattr(cfg.training, "n_critic_warmup_itr", 2) # critic网络先默认热身 2 轮
+    ema_alpha = getattr(cfg.training, "reward_ema_alpha", 0.05) # 推荐 0.05 或 0.01
+    target_kl = getattr(cfg.training, "target_kl", 0.02)
     # 在进入训练循环前，仅全局重置一次环境，保证后续 MDP (马尔可夫决策过程) 的连续性
     prev_obs, _ = env.reset()
     # 记录当前每个环境正在跑的回合的累计分数
@@ -391,15 +389,12 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         reward_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
         terminated_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
         completed_ep_rewards = []                                # 存放所有【已经跑完】的回合的总分
-        completed_ep_successes = []                              # 存放成功标志 (假设环境 info 里有 success 信息)
         # ==========================================
         # 2. 开始收集环境交互数据 (Rollout Loop)
         # ==========================================
         actor.reset()
         logging.info(f"🏃 开始进入数据收集循环 (共 {n_steps} 步)...")
-        for step in range(n_steps):
-            if step > 0 and step % 10 == 0:
-                logging.info(f"  > 已收集 {step}/{n_steps} 步...")
+        for step in tqdm(range(n_steps), leave=False):
 
             # 将当前物理环境的画面压入历史队列
             for k, v in prev_obs.items():
@@ -496,11 +491,12 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 if n_envs > 1:
                     for env_idx in range(n_envs):
                         if just_done[env_idx]:
+                            # 将重置后状态对应的真实关节角度作为安全动作
                             safe_actions[env_idx] = obs_venv["observation.state"][env_idx][:action_venv.shape[-1]]
 
                 any_done_accum = any_done_accum | terminated_venv | truncated_venv   
                 
-                # 单环境：安全 break，完美逻辑
+                # 完成任务或者超时后，重新初始化环境，继续收集数据
                 if n_envs == 1 and any_done_accum[0]:
                     obs_venv, _ = env.reset()
                     break
@@ -565,8 +561,9 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                             tensor_v = tensor_v[:, -1]
                     obs_chunk[k] = tensor_v
                 
-                # 计算这批数据的 Value 并塞回 CPU 数组
-                values_flat[i:end_i] = critic(obs_chunk).cpu().numpy().flatten()
+                # 在送入 Critic 前，使用 Actor 的统计信息进行状态归一化
+                obs_chunk_norm = actor.normalize_inputs(obs_chunk.copy())
+                values_flat[i:end_i] = critic(obs_chunk_norm).cpu().numpy().flatten()
                 
             values_trajs = values_flat.reshape(n_steps, n_envs)
             
@@ -587,7 +584,22 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                         tensor_v = tensor_v[:, -1]
                 last_obs_ts[k] = tensor_v
                 
-            next_values_last = critic(last_obs_ts).cpu().numpy().flatten()
+            last_obs_ts_norm = actor.normalize_inputs(last_obs_ts.copy())
+            next_values_last = critic(last_obs_ts_norm).cpu().numpy().flatten()
+
+
+        # 使用 EMA 动态缩放全局 Reward
+        batch_reward_std = reward_trajs.std()
+        if batch_reward_std > 1e-8:
+            if itr == 0:
+                # 🚀 冷启动修复：第一轮直接使用真实的批次标准差，瞬间对齐量级！
+                running_reward_std = batch_reward_std
+            else:
+                # 动态更新全局标准差 (95% 的历史记忆 + 5% 的新知识)
+                running_reward_std = (1 - ema_alpha) * running_reward_std + ema_alpha * batch_reward_std
+            
+        # 使用平滑后的全局标尺进行缩放，确保 Critic 的目标是平稳的
+        reward_trajs = reward_trajs / running_reward_std
 
         # 2. 计算 GAE (逆向时间推导)
         advantages_trajs = np.zeros_like(reward_trajs)
@@ -620,7 +632,6 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         batch_size = getattr(cfg.training, "batch_size", 32)
         update_epochs = getattr(cfg.training, "update_epochs", 10)
         clip_ratio = getattr(cfg.training, "clip_ratio", 0.25)
-        entropy_coef = getattr(cfg.training, "entropy_coef", 1e-4)
 
         logging.info(f"🔄 开始 PPO 网络更新 (Epochs: {getattr(cfg.training, 'update_epochs', 4)})...")
         actor.train()
@@ -630,7 +641,10 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         returns_k = torch.from_numpy(returns_trajs).float().to(device).reshape(-1)
         advantages_k = torch.from_numpy(advantages_trajs).float().to(device).reshape(-1)
         
-        # 优势函数归一化 (极大地提升 PPO 训练稳定性)
+        # 提取旧的价值预估张量，用于 价值截断Value Clipping，让critic网络更新更稳定
+        values_k = torch.from_numpy(values_trajs).float().to(device).reshape(-1)
+
+        # 优势函数归一化 (防止太小更新太慢，极大地提升 PPO 训练稳定性)
         advantages_k = (advantages_k - advantages_k.mean()) / (advantages_k.std() + 1e-8)
         
         # 将 Chains 展平为 [(步数*环境数), 去噪步数, 预测视野, 动作维度]
@@ -668,7 +682,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
 
                     obs_eval[k] = tensor_v
 
-                logprobs, _ = actor.get_logprobs(
+                logprobs = actor.get_logprobs(
                     cond=obs_eval, 
                     x_t=chains_k[b_inds, d_inds], 
                     x_t_1=chains_k[b_inds, d_inds + 1], 
@@ -677,7 +691,11 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 old_logprobs_k[inds] = logprobs
 
         # 2. 开始 Epoch 循环，PPO的数据集可以训练多轮，数据利用率高
+        early_stop = False
         for epoch in tqdm(range(update_epochs), desc=f"⏳ PPO 更新中 (Iter {itr+1})", leave=False):
+            # 每一轮 Epoch 开始前检查，如果已熔断，彻底跳出 Epoch 循环，开启新的一轮迭代
+            if early_stop:
+                break
             # 打乱所有数据点 (不仅打乱时间步，还打乱去噪步)
             indices = torch.randperm(total_steps, device=device)
             num_batch = max(1, total_steps // batch_size) #分批次训练
@@ -716,9 +734,11 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 chains_prev_b = chains_k[batch_inds_b, denoising_inds_b]      # 对应样本的当前去噪步 动作
                 chains_next_b = chains_k[batch_inds_b, denoising_inds_b + 1]  # 对应样本的下一个去噪步 动作
                 returns_b = returns_k[batch_inds_b]                           # 对应样本的总回报
-                advantages_b = advantages_k[batch_inds_b]                     # 对应样本的优势值
+                advantages_b = advantages_k[batch_inds_b]                     # 每一轮去噪步公用一个优势值
                 timesteps_b = recorded_timesteps[denoising_inds_b]
                 
+                # 取出对应样本的旧价值预估
+                old_values_b = values_k[batch_inds_b]
                 # 取出旧策略的对数概率
                 old_logprobs_b = old_logprobs_k[inds_b]
                 
@@ -730,7 +750,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 # 🌟 网络 Loss 计算区 (真正的 PPO 数学魔法)
                 # ----------------------------------------------------
                 # 1. 计算当前网络对动作的新概率预测
-                new_logprobs_b, entropy_b = actor.get_logprobs(
+                new_logprobs_b = actor.get_logprobs(
                     cond=obs_b, 
                     x_t=chains_prev_b, 
                     x_t_1=chains_next_b, 
@@ -747,12 +767,33 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages_b
                 pg_loss = -torch.min(surr1, surr2).mean()
                 
-                # 4. Critic MSE 损失
-                values_pred = critic(obs_b_critic).squeeze(-1)
-                v_loss = torch.nn.functional.mse_loss(values_pred, returns_b)
+                # 4. Critic MSE 损失，统一归一化，彻底消灭量纲方差灾难
+                obs_b_critic_norm = actor.normalize_inputs(obs_b_critic.copy())
+                values_pred = critic(obs_b_critic_norm).squeeze(-1)
                 
+                # 限制当前价值预测值相对于旧价值的变动幅度，防止价值更新步子太大、训练震荡。
+                values_pred_clipped = old_values_b + torch.clamp(
+                    values_pred - old_values_b, -clip_ratio, clip_ratio
+                )
+                # 用smooth_l1_loss代替mse_loss计算两个 Loss，对异常值不敏感，训练更稳
+                v_loss_unclipped = torch.nn.functional.smooth_l1_loss(values_pred, returns_b, reduction="none")
+                v_loss_clipped = torch.nn.functional.smooth_l1_loss(values_pred_clipped, returns_b, reduction="none")
+                
+                # 取最大值，意味着只要截断前或截断后的误差有一个变大了，我们就用大的那个惩罚它
+                v_loss = torch.max(v_loss_unclipped, v_loss_clipped).mean()
                 # 5. 总 Loss 汇总
-                loss = pg_loss + 0.5 * v_loss - entropy_coef * entropy_b
+                loss = pg_loss + 0.5 * v_loss   
+
+
+                with torch.no_grad():
+                    approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean().item()
+                # 早期熔断 (Early Stopping)
+                if approx_kl > 1.5 * target_kl:
+                    logging.warning(f"⚠️ 策略偏离过大 (KL: {approx_kl:.4f} > {1.5 * target_kl})，触发早期熔断！")
+                    early_stop = True # 用于跳出当前epoch
+                    break # 跳出当前batch
+
+
                 loss.backward()
                 
                 torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
@@ -842,7 +883,7 @@ if __name__ == "__main__":
         "policy=ft_static_diffusion",
         "training.pretrained_ckpt_path='outputs/pretrain/train/2026-04-21/12-09-35_SewNeedle-2Arms-v0_pre_static_diffusion/checkpoints/0330000_loss=0.0234'",
         "env.n_envs=5",
-        "training.rollout_steps=200", 
+        "training.rollout_steps=100", 
         "training.batch_size=24",     
         "training.update_epochs=5",     
         "wandb.enable=false",
