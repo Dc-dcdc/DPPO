@@ -20,6 +20,8 @@ training:
   pretrained_ckpt_path: "outputs/pretrain/train/.../checkpoints/050000"
   min_sampling_denoising_std: 0.1  # 为 DDIM 采样注入的动作探索标准差
   rollout_steps: 500
+  reward_ema_alpha: 0.05 #滑动更新全局奖励方差
+  target_kl: 0.02
 
 
 eval:
