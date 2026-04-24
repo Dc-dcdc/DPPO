@@ -165,6 +165,7 @@ class GuidedVisionEnv(gym.Env):
         self._physics.bind(self._middle_actuators).ctrl = MIDDLE_ARM_POSE
         # 强制物理引擎进行一次正向运动学计算
         self._physics.forward() 
+        self.terminated = False
         # 读取当前环境的观测
         observation = self.get_obs()
         info = {"message": "Environment reset successfully."}
@@ -202,13 +203,13 @@ class GuidedVisionEnv(gym.Env):
         reward = self.get_reward() if hasattr(self, 'get_reward') else 0.0
         
         # 6. 判断终止条件
-        max_rwd = getattr(self, 'max_reward', -1)
-        terminated = bool(reward >= max_rwd - 1e-4) # 达到最大奖励则任务成功结束
+        # max_rwd = getattr(self, 'max_reward', -1)
+        # terminated = bool(reward >= max_rwd - 1e-4) # 达到最大奖励则任务成功结束
         truncated = bool(self._current_step >= self.episode_length) # 超出最大步数
         
-        info = {"is_success": terminated, "reward": reward, "step": self._current_step}
+        info = {"is_success": self.terminated, "reward": reward, "step": self._current_step}
 
-        return observation, float(reward),  terminated, truncated, info
+        return observation, float(reward),  self.terminated, truncated, info
 
     def render(self,render_camera):
         """
@@ -255,7 +256,6 @@ class SewNeedleEnv(GuidedVisionEnv):
         xml_path = os.path.join(XML_DIR, 'task_sew_needle.xml')
         super().__init__(xml_path, **kwargs)
 
-        self.max_reward = 5
         self._needle_joint = self._mjcf_root.find('joint', 'needle_joint')
         self._wall_joint = self._mjcf_root.find('joint', 'wall_joint')
         self._threaded_needle = False
@@ -283,7 +283,10 @@ class SewNeedleEnv(GuidedVisionEnv):
 
         self._physics.forward()
         self._threaded_needle = False
-
+        self.needle_reached_exit = False  # 针头穿墙标志位
+        self.left_has_grasped = False     # 左臂成功接针标志位
+        self.needle_completely_through = False # 针完全过孔标志位
+        self.needle_start_through = False # 针开始过孔标志位        
         observation = self.get_obs()
         info = {"message": "SewNeedle env reset."}
         return observation, info
@@ -291,48 +294,141 @@ class SewNeedleEnv(GuidedVisionEnv):
     def get_reward(self):
         touch_left_gripper = False
         touch_right_gripper = False
-        needle_touch_table = False
-        needle_touch_wall = False
-        needle_touch_pin = False
+        # 存放当前帧里所有碰到针的物体名字
+        objects_touching_needle = set()
 
-        # 碰撞检测
-        contact_pairs = []
+        # 遍历底层物理引擎计算出的所有有效接触点 (Contacts)
         for i_contact in range(self._physics.data.ncon):
+            # 提取发生碰撞的两个物体的底层 ID
             id_geom_1 = self._physics.data.contact[i_contact].geom1
             id_geom_2 = self._physics.data.contact[i_contact].geom2
+            
+            # 将底层 ID 翻译成你在 XML 环境文件中定义的名字 (如 "peg", "right_finger_1")
             geom1 = self._physics.model.id2name(id_geom_1, 'geom')
             geom2 = self._physics.model.id2name(id_geom_2, 'geom')
-            contact_pairs.append((geom1, geom2))
-            contact_pairs.append((geom2, geom1))
-
-        for geom1, geom2 in contact_pairs:
-            if geom1 == "needle" and geom2.startswith("right"):
-                touch_right_gripper = True    # 右手碰到了针
-            if geom1 == "needle" and geom2.startswith("left"):
-                touch_left_gripper = True     # 左手碰到了针
-            if geom1 == "table" and geom2 == "needle":
-                needle_touch_table = True     # 针接触到桌面
-            if geom1 == "needle" and geom2.startswith("wall-"):
-                needle_touch_wall = True      # 针接触到墙
-            if geom1 == "pin-needle" and geom2 == "pin-wall":
-                self._threaded_needle = True  # 针穿过墙
-            if geom1 == "needle" and geom2 == "pin-wall":
-                needle_touch_pin = True       # 针接触到墙
-
-        # 塑造奖励 (Reward Shaping)
-        reward = 0
-        if touch_right_gripper:                                 # 右臂碰到了针
-            reward = 1
-        if touch_right_gripper and (not needle_touch_table):    # 右臂成功抓起了针
-            reward = 2
-        if needle_touch_wall and (not needle_touch_table):      # 针接触到墙壁，且未掉落
-            reward = 3
-        if self._threaded_needle:                               # 穿针成功
-            reward = 4
-        if touch_left_gripper and (not touch_right_gripper) and (not needle_touch_table) and (not needle_touch_pin) and self._threaded_needle: # 完美穿针并成功换手交接
-            reward = 5
             
-        return reward
+            # 只有两个物体都有名字时，才加入判定列表(双向记录)
+            if geom1 and geom2:
+                # 2. 只要有一方是针，就把另一方的名字扔进篮子
+                if geom1 == "needle":
+                    objects_touching_needle.add(geom2)
+                elif geom2 == "needle":
+                    objects_touching_needle.add(geom1)
+
+        # 检查左夹爪是否成功捏住：左半边手指碰到了，且右半边手指也碰到了
+        touched_left_left = any(obj.startswith("left_left_g2") for obj in objects_touching_needle)
+        touched_left_right = any(obj.startswith("left_right_g2") for obj in objects_touching_needle)
+        if touched_left_left and touched_left_right:
+            touch_left_gripper = True
+            
+        # 检查右夹爪是否成功捏住
+        touched_right_left = any(obj.startswith("right_left_g2") for obj in objects_touching_needle)
+        touched_right_right = any(obj.startswith("right_right_g2") for obj in objects_touching_needle)
+        if touched_right_left and touched_right_right:
+            touch_right_gripper = True
+
+        # ==========================================
+        # 提取相关坐标
+        # ==========================================
+        needle_head = self._physics.named.data.geom_xpos['needle_head']                #针头
+        needle_tail = self._physics.named.data.geom_xpos['needle_tail']                #针尾
+        needle_left_pos = self._physics.named.data.geom_xpos['needle_mark_1_4']        #左臂抓取标记点 1/4处
+        needle_right_pos = self._physics.named.data.geom_xpos['needle_mark_3_4']       #右臂抓取标记点 3/4处
+        
+        left_left_finger = self._physics.named.data.geom_xpos['left_left_g2']
+        left_right_finger = self._physics.named.data.geom_xpos['left_right_g2']        
+        right_left_finger = self._physics.named.data.geom_xpos['right_left_g2']        #右臂左指尖
+        right_right_finger = self._physics.named.data.geom_xpos['right_right_g2']      #右臂右指尖
+
+        hole_entrance = self._physics.named.data.geom_xpos['hole_entrance']            #出洞口
+        hole_exit = self._physics.named.data.geom_xpos['hole_exit']                    #出洞口
+
+        # ==========================================
+        # 计算左右臂和针距离奖励
+        # ==========================================
+        # 计算右臂夹爪的中心点 (Pinch Center)
+        left_gripper_center = (left_left_finger + left_right_finger) / 2.0
+        right_gripper_center = (right_left_finger + right_right_finger) / 2.0
+
+        # 计算右臂夹爪中心到针标记点的距离
+        dist_left_to_mark = np.linalg.norm(left_gripper_center - needle_left_pos)
+        dist_right_to_mark = np.linalg.norm(right_gripper_center - needle_right_pos)
+        
+        # ==========================================
+        # 计算针穿过墙洞的奖励
+        # ==========================================
+        # 计算针头到“洞口出口(hole_exit)”的距离
+        dist_head_to_exit = np.linalg.norm(needle_head - hole_exit)
+        
+        # 判定条件：针头超过出洞口
+        if needle_head[0] < hole_exit[0] and dist_head_to_exit < 0.01: 
+            self.needle_reached_exit =True
+        # 必须是针头已经穿出去了，且左手碰到了针，才算正式交接成功
+        if self.needle_reached_exit and touch_left_gripper:
+            self.left_has_grasped = True
+
+        # ==========================================
+        # 阶段流转奖励逻辑
+        # ==========================================
+        # 每走一步扣 0.5 分，降低步数
+        reward = -0.5
+
+        # 左臂还没接针，右臂主导
+        if not self.left_has_grasped:
+            # --- 前半场：右臂主导 ---
+
+            # 引导右臂接近 针3/4 处的奖励
+            reward += 2.0 * np.exp(-15.0 * dist_right_to_mark)
+
+            # 计算针头到入口的距离
+            dist_head_to_entrance = np.linalg.norm(needle_head - hole_entrance)
+
+            # 检测针头是否进洞,给个很小的值防止在外面就判断进去了 ，加上3d距离防止绕墙
+            if needle_head[0] - hole_entrance[0]< 0.001 and dist_head_to_entrance < 0.01 :
+                self.needle_start_through = True
+            
+            # 2. 只有在右臂抓牢针的情况下，才计算后续的运送/插入奖励！(防止隔空刷分)
+            if touch_right_gripper:                                 
+                reward += 1.0 # 右臂抓取稀疏奖励
+                
+                if not self.needle_start_through:
+                    # 没到达洞口，引导针头到达入口 （最高5分）
+                    reward += 5.0 * np.exp(-15.0 * dist_head_to_entrance)
+                else:
+                    reward += 5.0
+                    # 已经到达洞口，给予一个持续往里推的连续奖励
+                    reward += 5.0 * np.exp(-20.0 * dist_head_to_exit)
+
+            # 如果针头露出来了，引导左臂开始靠近接应
+            if self.needle_reached_exit:
+                # 此时总收益：基础分(-0.5 + 1.0 + 5.0 + 5.0) = 10.5
+                # 左臂接应最多3分
+                reward += 3.0 * np.exp(-15.0 * dist_left_to_mark)
+        else: 
+            # --- 后半场：左臂主导 ---
+
+            # 惩罚右手，逼迫其松开并让开空间
+            if touch_right_gripper:
+                reward -= 1.0 
+
+            # 3. 终极判定：针尾是否完全越过出口
+            # 计算针尾到出口的距离
+            dist_tail_to_exit = np.linalg.norm(needle_tail - hole_exit)
+
+            # 穿孔方向为沿着 X 轴向负方向移动，针尾小于出口 且 距离小于设定值（防止从墙外面绕过）
+            if needle_tail[0] < hole_exit[0] and dist_tail_to_exit < 0.01:
+                self.needle_completely_through = True
+
+            if not self.needle_completely_through:
+
+                # 连续奖励：引导左臂继续往外拉，直到针尾到达出口
+                reward += 5.0 * np.exp(-15.0 * dist_tail_to_exit)
+            else:
+                # 阶段 C：任务圆满完成！
+                reward += 500.0 # 给予超高额的终极稀疏奖励，覆盖掉时间惩罚
+                self.terminated = True
+            
+        return float(reward)
 
 # ==========================================
 # 本地测试代码 (确保环境逻辑完美运行)
@@ -351,19 +447,19 @@ if __name__ == '__main__':
     right_gripper_state = obs['observation.state'][13]
     
     print("\n▶️ 开始执行 100 步随机游走测试...")
-    for i in range(100):
+    while True:
         step_start = time.time()
 
         # 生成合法的随机动作并执行
-        random_action = env.action_space.sample()
-        obs, reward, terminated, truncated, info = env.step(random_action)
+        # random_action = env.action_space.sample()
+        # obs, reward, terminated, truncated, info = env.step(random_action)
         
         # 启动可视化窗口
         env.render_viewer()
 
-        if terminated or truncated:
-            print(f"🎉 任务在第 {i} 步完成！获得了最大奖励 {reward}")
-            obs, info = env.reset()
+        # if terminated or truncated:
+        #     print(f"🎉 任务在第 {i} 步完成！获得了最大奖励 {reward}")
+        #     obs, info = env.reset()
 
         time_until_next_step = SIM_DT - (time.time() - step_start)
         time.sleep(max(0, time_until_next_step))

@@ -83,7 +83,7 @@ def make_optimizer_and_scheduler(cfg, policy):
         )
 
 
-    elif policy.name == "tdmpc": #对于TDMPC模型，我们使用了Adam优化器来更新模型的参数
+    elif cfg.policy.name == "tdmpc": #对于TDMPC模型，我们使用了Adam优化器来更新模型的参数
         optimizer = torch.optim.Adam(policy.parameters(), cfg.training.lr)
         lr_scheduler = None
     elif cfg.policy.name == "vqbet": #对于VQBeT模型，我们使用了自定义的VQBeTOptimizer来更新模型的参数
@@ -322,7 +322,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # 开启 CuDNN 加速和 TF32 支持
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
-
+    torch.set_float32_matmul_precision('high')
     # ==========================================
     # 🌟 1. 动态构建时间戳与挂载数据集
     # ==========================================
@@ -550,11 +550,11 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
-        "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
-        "policy=pre_zed_diffusion", # 策略
-        "resume=false",
-        "resume_path=outputs/pretrain/train/2026-04-22/10-59-57_SewNeedle-2Arms-v0_pre_static_diffusion/checkpoints/last",
-        "training.batch_size=32",
+        "env=sim_sew_needle_2arms", # 环境，这俩定义在default文件中
+        "policy=pre_static_wrist_diffusion", # 策略
+        "resume=true",
+        "resume_path=outputs/pretrain/train/2026-04-23/20-30-23_SewNeedle-2Arms-v0_pre_static_wrist_diffusion/checkpoints/last",
+        "training.batch_size=16",
         "training.num_workers=4",
         "wandb.enable=FaLse" ,
     ]

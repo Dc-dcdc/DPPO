@@ -27,13 +27,13 @@ training:
   lr_warmup_steps: 500      # 预热步数：模型刚开始是白纸，用 500 步慢慢把学习率升到 1e-4，防止梯度爆炸，一般设置为总步数的1-5%
   offline_steps: 1000000      # 离线训练总步数
   online_steps: 0
-  save_freq: 5000 # 每 5000 步保存一次模型快照
+  save_freq: 2000 # 每 5000 步保存一次模型快照
   log_freq: 100
   save_checkpoint: true
   num_workers: 4   # Number of workers for the offline training dataloader.
   batch_size: 16
   lr: 1e-4 # 学习率
-  weight_decay: 1e-4 # L2正则化
+  weight_decay: 1e-6 # L2正则化
   grad_clip_norm: 10 # 梯度裁剪
   online_steps_between_rollouts: 1
   # 时间戳计算
@@ -49,7 +49,7 @@ training:
     observation.images.wrist_cam_right: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
 
 eval:
-  eval_freq: 5000
+  eval_freq: 2000
   batch_size: 1
   n_episodes: 10             # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 4   # 最多保存前几个 episode 的录像视频
@@ -67,7 +67,7 @@ policy:
   n_obs_steps: 2 # 2帧历史画面
   horizon : 16 # 推理总步数   一个horizon视为一个动作块
   n_action_steps: 8 # 执行的实际步数
-  crop_shape: [224, 224] # 裁剪的图像尺寸
+  crop_shape: [384, 384] # 裁剪的图像尺寸
   crop_is_random: false  # 强制进行中心裁剪，保证目标始终在视野内
   input_shapes:
     # TODO(rcadene, alexander-soare): add variables for height and width from the dataset/env?
@@ -116,11 +116,11 @@ policy:
   beta_start: 0.0001
   beta_end: 0.02
   prediction_type: epsilon            # 预测目标：噪声 (epsilon)
-  clip_sample: true
+  clip_sample: false
   clip_sample_range: 1.0
 
   # ==========================================
   # 5. 推理与 EMA (Inference & EMA)
   # ==========================================
   use_ema: true                       # 【关键】必须开启,降低精度提升推理速度
-  ema_decay: 0.9999                   # 【关键】EMA 的衰减系数
+  ema_decay: 0.999                   # 【关键】EMA 的衰减系数

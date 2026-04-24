@@ -267,10 +267,10 @@
                         mesh="vx300s_8_custom_finger_left"/>
                       <geom name="right_left_finger" pos="0.0141637 0.0211727 0.06" class="collision" quat="1 1 1 -1" type="mesh"
                         mesh="vx300s_8_custom_finger_left"/>
-                      <geom name="right_left_g0" pos="0.013  -0.0892 0.0268" class="sphere_collision"/>
-                      <geom name="right_left_g1" pos="0.0222 -0.0892 0.0268" class="sphere_collision"/>
-                      <geom name="right_left_g2" pos="0.0182 -0.0845 0.0266" class="sphere_collision"/>
-                      <site name="right_left_finger" pos="0.015 -0.06 0.02"/>
+                      <geom name="right_left_g0" pos="0.013  -0.0892 0.0268" class="sphere_collision" />
+                      <geom name="right_left_g1" pos="0.0222 -0.0892 0.0268" class="sphere_collision" />
+                      <geom name="right_left_g2" pos="0.0182 -0.0845 0.0266" class="sphere_collision" />
+                      <site name="right_left_finger" pos="0.015 -0.06 0.02" />
                     </body>
                     <body name="right_right_finger_link" pos="-0.0191 -0.0141637 0.0211727" quat="1 1 1 1">
                       <inertial pos="0.0143711 0.0284792 0.0121421" quat="0.461317 0.537615 -0.545478 0.447894"

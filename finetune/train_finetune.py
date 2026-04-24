@@ -857,7 +857,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             final_videos_dir = Path(out_dir) / "eval" / f"videos_{ckpt_name}"
 
             # 执行文件夹重命名 (把 tmp_videos_... 改成 videos_000005_sr=...)
-            if tmp_videos_dir.exists():
+            if tmp_videos_dir.exists() and tmp_videos_dir != final_videos_dir:
                 import shutil
                 # 使用 shutil.move 比 Path.rename 更安全，能兼容跨盘操作
                 shutil.move(str(tmp_videos_dir), str(final_videos_dir))
@@ -870,6 +870,8 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             # 💡 核心技巧：因为 manager 的逻辑是 loss 越小越保留 (从小到大排序)
             # 我们想保留 Average Reward 最高的，所以传入负的 reward (-ar) 作为假 loss
             ckpt_manager.update(step=itr+1, loss=-ar, ckpt_path=save_path)
+
+
 @hydra.main(version_base="1.2", config_name="ft_default", config_path="../configs/finetune")
 def train_cli(cfg: DictConfig):
     train_dppo_finetune(
@@ -881,10 +883,10 @@ if __name__ == "__main__":
     # 命令行参数注入
     default_args = [
         "policy=ft_static_diffusion",
-        "training.pretrained_ckpt_path='outputs/pretrain/train/2026-04-21/12-09-35_SewNeedle-2Arms-v0_pre_static_diffusion/checkpoints/0330000_loss=0.0234'",
-        "env.n_envs=5",
-        "training.rollout_steps=100", 
-        "training.batch_size=24",     
+        "training.pretrained_ckpt_path='outputs/pretrain/train/2026-04-23/20-30-23_SewNeedle-2Arms-v0_pre_static_wrist_diffusion/checkpoints/0126000_loss=0.0042'",
+        "env.n_envs=2",
+        "training.rollout_steps=200", 
+        "training.batch_size=8",     
         "training.update_epochs=5",     
         "wandb.enable=false",
     ]

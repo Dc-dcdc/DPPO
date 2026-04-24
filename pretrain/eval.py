@@ -9,7 +9,7 @@ from contextlib import nullcontext
 import gymnasium as gym
 import yaml
 from pathlib import Path
-
+from tqdm import tqdm
 # ==========================================
 # 🌟 [新增] 自定义 Top-K 快照管理器(包含视频同步清理)
 # ==========================================
@@ -115,15 +115,14 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     fps = getattr(cfg_eval, "fps", 25)
     max_steps = getattr(cfg_eval, "max_steps", 300)
     raw_camera = getattr(cfg_eval, "render_camera", 'overhead_cam')
-    #适配字符串和列表，即['overhead_cam']和'overhead_cam'
-    render_camera = raw_camera[0] if isinstance(raw_camera, (list, tuple)) else raw_camera 
+    
+    render_camera = raw_camera
     # 动作执行循环
-    for ep in range(n_episodes):
+    for ep in tqdm(range(n_episodes), leave=False):
         obs, _ = env.reset()
         done = False
         frames = []
         ep_reward = 0
-        
         # LeRobot/DPPO 的 Policy 内置了 action chunking 队列
         policy.reset() # 清空模型的动作缓冲历史
 
@@ -156,6 +155,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
             # 5. 与环境交互
             obs, reward, terminated, truncated, info = env.step(action_np)
             ep_reward += float(reward)
+
             done = terminated or truncated
 
             if done:
@@ -167,8 +167,9 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
 
         # 6. 根据配置的帧率和最大渲染数量保存视频
         if ep < max_rendered and len(frames) > 0:
+            status = "Success" if successes[ep] else "Fail"
             # 格式：012500_reward=150.5_cam_overhead_ep_0.mp4
-            video_name = f"cam_{render_camera[0]}_ep_{ep}_reward={ep_reward:.1f}.mp4"
+            video_name = f"{render_camera[0]}_ep_{ep}_reward={ep_reward:.1f}_{status}.mp4"
             video_path = videos_dir / video_name
             imageio.mimsave(str(video_path), frames, fps=fps)
             logging.info(f"🎥 保存视频: {video_path.name}")
@@ -265,14 +266,13 @@ if __name__ == "__main__":
     # ==========================================
     eval_cfg = SimpleNamespace(
         # 📂 模型路径设置 (直接指向 0000600_loss=0.1540 文件夹即可，代码会自动寻找内部结构)
-        ckpt_path="outputs/pretrain/train/2026-04-15/22-11-55_sim_envs_diffusion_pretrain_zed_diffusion_2026-04-15_22-11-55/checkpoints/0620000",
-        name = 'sim_envs', #会自动加载，可以不改
-        task = 'SewNeedle-3Arms-v0', #会自动加载，可以不改
+        ckpt_path="outputs/finetune/train/2026-04-24/17-19-22_SewNeedle-2Arms-v0_ft_static_diffusion/checkpoints/000003_sr=0.30_reward=721.72",
         # ⚙️ 评估参数设置
-        n_episodes=4,             # 评估多少个任务                 
-        max_episodes_rendered=4,  # 保存多少个视频 
+        seed=100,
+        n_episodes=100,             # 评估多少个任务                 
+        max_episodes_rendered=10,  # 保存多少个视频 
         fps=25,                   # 视频帧率，和环境控制频率对齐
-        max_steps=400,            # 每个任务的最大步数
+        max_steps=300,            # 每个任务的最大步数
         
         # 📷 相机设置
         render_camera=['overhead_cam']         # 保存video的相机视角              
@@ -282,6 +282,8 @@ if __name__ == "__main__":
 
     def main():
         ckpt_path = eval_cfg.ckpt_path
+        from lerobot.common.utils.utils import set_global_seed
+        set_global_seed(eval_cfg.seed)
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"❌ 找不到权重路径: {ckpt_path}\n请检查路径是否正确。")
         # ==========================================
@@ -322,6 +324,7 @@ if __name__ == "__main__":
         ref_cams = [k.replace("observation.images.", "") for k in all_obs_keys if "observation.images." in k]
         if not ref_cams:
             raise ValueError(f"❌ 严重冲突：模型中未找到相机相关参数。请检查模型输入是否正确。")
+        
         obs_cameras = list(dict.fromkeys(ref_cams + eval_cfg.render_camera))
         # 动态读取环境元数据 (直接从 load_dir 读取)
         
@@ -371,10 +374,29 @@ if __name__ == "__main__":
             )
 
         # ==========================================
-        # 🌟 6.打印最终结果
+        # 🌟 6.整理指标，重命名文件夹归档视频
         # ==========================================
+        import shutil
         sr = eval_info["aggregated"]["success_rate"]
         ar = eval_info["aggregated"]["average_reward"]
+        
+        # 生成直观的文件夹名称 (例如: eval_seed100_sr85.0_ar150.5)
+        new_folder_name = f"eval_seed={eval_cfg.seed}_ep={eval_cfg.n_episodes}_sr={sr*100:.1f}_ar={ar:.2f}"
+        new_videos_dir = os.path.join(videos_dir, new_folder_name)
+        os.makedirs(new_videos_dir, exist_ok=True)
+        
+        # 将刚刚生成的视频全部移动到新文件夹中
+        moved_count = 0
+        for video_path in eval_info["video_paths"]:
+            if os.path.exists(video_path):
+                file_name = os.path.basename(video_path)
+                shutil.move(video_path, os.path.join(new_videos_dir, file_name))
+                moved_count += 1
+                
+
+        # ==========================================
+        # 🌟 7.打印最终结果
+        # ==========================================
         print("\n" + "="*50)
         print(f"🎉 独立评估完成！")
         print(f"🏆 成功率 (Success Rate): {sr*100:.1f}%")

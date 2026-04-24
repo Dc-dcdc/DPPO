@@ -56,7 +56,7 @@ policy:
   n_obs_steps: 2 # 2帧历史画面
   horizon : 16 # 推理总步数   一个horizon视为一个动作块
   n_action_steps: 8 # 执行的实际步数
-  crop_shape: [224, 224] # 裁剪的图像尺寸
+  crop_shape: [384, 384] # 裁剪的图像尺寸
   crop_is_random: false  # 强制进行中心裁剪，保证目标始终在视野内
   input_shapes:
     # TODO(rcadene, alexander-soare): add variables for height and width from the dataset/env?
@@ -78,7 +78,7 @@ policy:
   # 2. 视觉特征提取 (Vision Backbone)
   # ==========================================
   vision_backbone: resnet18
-  # pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1 #预训练的视觉编码器模型，一般来说会设置较小的lr_backbone进行微调，这里不设置，直接使用和unet一样的学习率
+  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1 #预训练的视觉编码器模型，一般来说会设置较小的lr_backbone进行微调，这里不设置，直接使用和unet一样的学习率
   use_group_norm: true                # 【新增】配合 Diffusion
   spatial_softmax_num_keypoints: 32   # 【新增】提取图片关键点，替代 ACT 的特征平铺
 
@@ -101,11 +101,11 @@ policy:
   beta_start: 0.0001
   beta_end: 0.02
   prediction_type: epsilon            # 预测目标：噪声 (epsilon)
-  clip_sample: true
+  clip_sample: false
   clip_sample_range: 1.0
 
   # ==========================================
   # 5. 推理与 EMA (Inference & EMA)
   # ==========================================
   use_ema: true                       # 【关键】必须开启,降低精度提升推理速度
-  ema_decay: 0.9999                   # 【关键】EMA 的衰减系数
+  ema_decay: 0.999                   # 【关键】EMA 的衰减系数
