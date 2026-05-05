@@ -1,4 +1,5 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True" # 开启 PyTorch CUDA 显存动态分片 + 可扩展内存分配，不再一次性预占用大块连续显存
 # 没有显示器时使用，比如在服务器上
 # os.environ["MUJOCO_GL"] = "egl"
 # os.environ["EGL_DEVICE_ID"] = "0"
@@ -295,7 +296,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # 4.1 提取并清洗相机参数 (防止单一字符串被误拆为字母列表)
     # ---------------------------------------------------------
     n_envs = getattr(cfg.env, "n_envs", 1)
-    render_cams = getattr(cfg.env, "render_camera", [])
+    render_cams = getattr(cfg.eval, "render_camera", [])
     
     # 安全处理：如果是纯字符串 "top"，转换为 ["top"]；如果是列表则保持；None 则设为空列表
     if render_cams is None:
@@ -690,6 +691,9 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 )
                 old_logprobs_k[inds] = logprobs
 
+        running_v_loss = []
+        running_pg_loss = []
+
         # 2. 开始 Epoch 循环，PPO的数据集可以训练多轮，数据利用率高
         early_stop = False
         for epoch in tqdm(range(update_epochs), desc=f"⏳ PPO 更新中 (Iter {itr+1})", leave=False):
@@ -742,9 +746,9 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 # 取出旧策略的对数概率
                 old_logprobs_b = old_logprobs_k[inds_b]
                 
-
-                actor_optimizer.zero_grad()
-                critic_optimizer.zero_grad()
+                #  使用 set_to_none=True 节省大量显存
+                actor_optimizer.zero_grad(set_to_none=True)
+                critic_optimizer.zero_grad(set_to_none=True)
                 
                 # ----------------------------------------------------
                 # 🌟 网络 Loss 计算区 (真正的 PPO 数学魔法)
@@ -762,7 +766,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 log_ratio = torch.clamp(log_ratio, min=-20.0, max=5.0)
                 ratio = torch.exp(log_ratio)
                 
-                # 3. PPO 截断代理损失 (Clipped Surrogate Objective)
+                # 3. PPO 截断代理损失，把控单次更新范围
                 surr1 = ratio * advantages_b
                 surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages_b
                 pg_loss = -torch.min(surr1, surr2).mean()
@@ -784,13 +788,27 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 # 5. 总 Loss 汇总
                 loss = pg_loss + 0.5 * v_loss   
 
+                running_v_loss.append(v_loss.item())
+                running_pg_loss.append(pg_loss.item())
 
                 with torch.no_grad():
                     approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean().item()
-                # 早期熔断 (Early Stopping)
-                if approx_kl > 1.5 * target_kl:
-                    logging.warning(f"⚠️ 策略偏离过大 (KL: {approx_kl:.4f} > {1.5 * target_kl})，触发早期熔断！")
+                # 早期熔断 (Early Stopping)，把控整体策略偏移量
+                if approx_kl > target_kl:
+                    logging.warning(f"⚠️ 策略偏离过大 (KL: {approx_kl:.4f} > {target_kl})，触发早期熔断！")
                     early_stop = True # 用于跳出当前epoch
+
+                    # 🌟 修复 2：极其重要！必须手动销毁所有带梯度的局部变量，释放几 GB 的计算图！
+                    try:
+                        del loss, pg_loss, v_loss, new_logprobs_b, log_ratio, ratio, surr1, surr2, values_pred, v_loss_unclipped, v_loss_clipped
+                    except Exception:
+                        pass
+                    
+                    # 清空优化器里的残余状态，并强制清空显存缓存
+                    actor_optimizer.zero_grad(set_to_none=True)
+                    critic_optimizer.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+
                     break # 跳出当前batch
 
 
@@ -798,22 +816,40 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 
                 torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
                 torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-                
+
+                # critic网络需要一直更新
+                critic_optimizer.step()
                 # 只有当迭代轮次超过热身期，才允许更新 Actor 的预训练权重
                 if itr >= critic_warmup_iters:
                     actor_optimizer.step()
-                    critic_optimizer.step()
+                    
                 
+        # =========================================================
+        # 🌟 修复 4：PPO 阶段结束，清扫全部巨大的训练经验张量，让显存归还给评估和下一次 Rollout
+        # =========================================================
+        try:
+            del chains_k, returns_k, advantages_k, values_k, old_logprobs_k, obs_k_cpu
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+
         # ------------------------------------------
         # 步骤 E：打印评估指标 (替代原论文代码)
         # ------------------------------------------
         if len(completed_ep_rewards) > 0:
             avg_ep_return = np.mean(completed_ep_rewards)
             max_ep_return = np.max(completed_ep_rewards)
+            avg_v_loss = np.mean(running_v_loss) if running_v_loss else 0.0
+            avg_pg_loss = np.mean(running_pg_loss) if running_pg_loss else 0.0
             logging.info(f"✅ 第 {itr+1} 轮完成！")
             logging.info(f"   🏃 本轮共完成回合数: {len(completed_ep_rewards)}")
             logging.info(f"   💰 平均回合总奖励 (Return): {avg_ep_return:.2f}")
             logging.info(f"   🏆 最高回合奖励: {max_ep_return:.2f}")
+            # 🌟 打印平均 Loss
+            logging.info(f"   📉 Critic (Value) Loss: {avg_v_loss:.4f}")
+            logging.info(f"   📉 Actor (Policy) Loss: {avg_pg_loss:.4f}")
             
             # 如果配置了 WandB
             # logger.log_dict({"train/avg_return": avg_ep_return}, step=itr)
@@ -837,14 +873,15 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             # 使用 getattr 安全获取 cfg.eval，如果 yaml 里没配就传一个空字典
             eval_cfg_node = getattr(cfg, "eval", OmegaConf.create())
             
-            with torch.autocast(device_type=device.type) if getattr(cfg, "use_amp", False) else nullcontext():
-                eval_info = custom_eval_policy(
-                    env=eval_env,
-                    policy=actor,
-                    cfg_eval=eval_cfg_node,   
-                    videos_dir=tmp_videos_dir,  # 👈 先存到临时文件夹
-                    device=device
-                )
+            with torch.no_grad():
+                with torch.autocast(device_type=device.type) if getattr(cfg, "use_amp", False) else nullcontext():
+                    eval_info = custom_eval_policy(
+                        env=eval_env,
+                        policy=actor,
+                        cfg_eval=eval_cfg_node,   
+                        videos_dir=tmp_videos_dir,  # 👈 先存到临时文件夹
+                        device=device
+                    )
             
             # 3. 提取测试成绩
             sr = eval_info["aggregated"]["success_rate"]
@@ -852,8 +889,9 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             logging.info(f"📊 评估完成! 成功率: {sr*100:.1f}%, 平均奖励: {ar:.2f}")
 
             # 4. 保存模型权重快照 (LeRobot 标准格式)
-            ckpt_name = f"{itr+1:06d}_sr={sr:.2f}_reward={ar:.2f}"
-            save_path = Path(out_dir) / "checkpoints" / ckpt_name
+            ckpt_name = f"{itr+1:06d}_sr={sr:.2f}_reward={ar:.2f}_Ploss={avg_pg_loss:.4f}_Vloss={avg_v_loss:.4f}"
+            ckpt_path = Path(out_dir) / "checkpoints" / ckpt_name
+            save_path = Path(out_dir) / "checkpoints" / ckpt_name / "pretrained_model"
             final_videos_dir = Path(out_dir) / "eval" / f"videos_{ckpt_name}"
 
             # 执行文件夹重命名 (把 tmp_videos_... 改成 videos_000005_sr=...)
@@ -864,12 +902,26 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 logging.info(f"🎞️ 视频文件夹已重命名为: {final_videos_dir.name}")
             
             actor.save_pretrained(save_path)
-            logging.info(f"💾 模型快照已保存至: {save_path}")
+
+            # 4.2 [修复项] 保存训练环境与超参数的全局配置 (config.yaml)
+            save_path.mkdir(parents=True, exist_ok=True) # 确保目录已创建
+            config_out_path = save_path / "config.yaml"
+            with open(config_out_path, "w", encoding="utf-8") as f:
+                # 转换 Hydra 配置字典，开启 resolve=True 确保解析出真实的动态变量
+                yaml.dump(
+                    OmegaConf.to_container(cfg, resolve=True), 
+                    f, 
+                    allow_unicode=True,
+                    sort_keys=False # 保持原始 yaml 顺序
+                )
+            
+            logging.info(f"💾 模型快照及 config.yaml 已完整保存至: {save_path}")
+
             
             # 5. 交给 TopKCheckpointManager 进行同步清理
             # 💡 核心技巧：因为 manager 的逻辑是 loss 越小越保留 (从小到大排序)
             # 我们想保留 Average Reward 最高的，所以传入负的 reward (-ar) 作为假 loss
-            ckpt_manager.update(step=itr+1, loss=-ar, ckpt_path=save_path)
+            ckpt_manager.update(step=itr+1, loss=-ar, ckpt_path=ckpt_path)
 
 
 @hydra.main(version_base="1.2", config_name="ft_default", config_path="../configs/finetune")
@@ -882,12 +934,12 @@ def train_cli(cfg: DictConfig):
 if __name__ == "__main__":
     # 命令行参数注入
     default_args = [
-        "policy=ft_static_diffusion",
+        "policy=ft_static_wrist_diffusion",
         "training.pretrained_ckpt_path='outputs/pretrain/train/2026-04-23/20-30-23_SewNeedle-2Arms-v0_pre_static_wrist_diffusion/checkpoints/0126000_loss=0.0042'",
         "env.n_envs=2",
         "training.rollout_steps=200", 
-        "training.batch_size=8",     
-        "training.update_epochs=5",     
+        "training.batch_size=4",     
+        "training.update_epochs=2",     
         "wandb.enable=false",
     ]
     

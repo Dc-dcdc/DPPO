@@ -180,7 +180,7 @@
                         mesh="vx300s_8_custom_finger_left"/>
                       <geom name="left_left_g0" pos="0.013  -0.0892 0.0268" class="sphere_collision"/>
                       <geom name="left_left_g1" pos="0.0222 -0.0892 0.0268" class="sphere_collision"/>
-                      <geom name="left_left_g2" pos="0.0182 -0.0845 0.0266" class="sphere_collision"/>
+                      <geom name="left_left_g2" pos="0.0182 -0.0845 0.0266" class="sphere_collision" />
                       <site name="left_left_finger" pos="0.015 -0.06 0.02"/>
                     </body>
                     <body name="left_right_finger_link" pos="-0.0191 -0.0141637 0.0211727" quat="1 1 1 1">

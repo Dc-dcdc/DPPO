@@ -3,12 +3,13 @@
 seed: 1000
 
 
+
 override_dataset_stats:
-  observation.images.overhead_cam:
+  observation.images.wrist_cam_left:
     # stats from imagenet, since we use a pretrained vision model
     mean: [[[0.485]], [[0.456]], [[0.406]]]  # (c,1,1)
     std: [[[0.229]], [[0.224]], [[0.225]]]  # (c,1,1)
-  observation.images.worms_eye_cam:
+  observation.images.wrist_cam_right:
     # stats from imagenet, since we use a pretrained vision model
     mean: [[[0.485]], [[0.456]], [[0.406]]]  # (c,1,1)
     std: [[[0.229]], [[0.224]], [[0.225]]]  # (c,1,1)
@@ -24,7 +25,7 @@ training:
   num_workers: 4   # Number of workers for the offline training dataloader.
   batch_size: 16
   lr: 1e-4 # 学习率
-  weight_decay: 1e-4 # L2正则化
+  weight_decay: 1e-6 # L2正则化
   grad_clip_norm: 10 # 梯度裁剪
   online_steps_between_rollouts: 1
   # 时间戳计算
@@ -34,8 +35,8 @@ training:
     
     # 状态和图片向过去取 (例如 n_obs_steps 为 2)
     observation.state: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
-    observation.images.overhead_cam: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
-    observation.images.worms_eye_cam: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.wrist_cam_left: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.wrist_cam_right: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
 
 eval:
   eval_freq: 2000
@@ -43,7 +44,9 @@ eval:
   n_episodes: 10             # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 4   # 最多保存前几个 episode 的录像视频
   max_steps: 300             # 环境的单局最大步数截断
+  # reference_cameras : ['overhead_cam', 'worms_eye_cam']   #模型推理要用的相机图像（条件输入），需要与input_shapes中的相机名称一致
   render_camera : ['overhead_cam']                           # 评估时保存的video视角相机
+  # cameras : ['zed_cam_left', 'zed_cam_right', 'overhead_cam'] # 选择读取仿真环境中对应的相机，即环境中的观测obs
 
 
 policy:
@@ -58,16 +61,16 @@ policy:
   crop_is_random: false  # 强制进行中心裁剪，保证目标始终在视野内
   input_shapes:
     # TODO(rcadene, alexander-soare): add variables for height and width from the dataset/env?
-    observation.images.overhead_cam: [3, 480, 640]
-    observation.images.worms_eye_cam: [3, 480, 640]
+    observation.images.wrist_cam_left: [3, 480, 640]
+    observation.images.wrist_cam_right: [3, 480, 640]
     observation.state: ["${env.state_dim}"]
   output_shapes:
     action: ["${env.action_dim}"]
 
   # Normalization / Unnormalization
   input_normalization_modes:
-    observation.images.overhead_cam: mean_std
-    observation.images.worms_eye_cam: mean_std
+    observation.images.wrist_cam_left: mean_std
+    observation.images.wrist_cam_right: mean_std
     observation.state: mean_std
   output_normalization_modes:
     action: mean_std

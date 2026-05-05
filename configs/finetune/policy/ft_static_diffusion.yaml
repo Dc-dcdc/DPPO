@@ -8,7 +8,6 @@ env:
   name : sim_envs
   task : SewNeedle-2Arms-v0
   n_envs: 1                            # 并行环境数量
-  render_caera : ['overhead_cam']     # 评估时保存的video视角相机
 
 training:
   # 预训练权重的绝对路径 (用来初始化 Actor)
@@ -31,7 +30,7 @@ training:
 
 eval:
   eval_freq: 1               # 评估频率
-  render_camera: ['overhead_cam']
+  render_camera: ['overhead_cam'] # 评估时保存的video视角相机
 
 policy:
   name: diffusion

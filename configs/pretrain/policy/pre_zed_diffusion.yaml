@@ -17,9 +17,9 @@ override_dataset_stats:
 training:
   lr_scheduler: "cosine"    # 调度器策略：强烈推荐 "cosine" (余弦衰减)，让模型在末期平滑落地
   lr_warmup_steps: 500      # 预热步数：模型刚开始是白纸，用 500 步慢慢把学习率升到 1e-4，防止梯度爆炸，一般设置为总步数的1-5%
-  offline_steps: 1000000      # 离线训练总步数
+  offline_steps: 500000      # 离线训练总步数
   online_steps: 0
-  save_freq: 100 # 每 5000 步保存一次模型快照
+  save_freq: 2000 # 每 5000 步保存一次模型快照
   log_freq: 100
   save_checkpoint: true
   num_workers: 4   # Number of workers for the offline training dataloader.
@@ -39,7 +39,7 @@ training:
     observation.images.zed_cam_right: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
 
 eval:
-  eval_freq: 100
+  eval_freq: 2000
   batch_size: 1
   n_episodes: 10             # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 4   # 最多保存前几个 episode 的录像视频
@@ -79,7 +79,7 @@ policy:
   # 2. 视觉特征提取 (Vision Backbone)
   # ==========================================
   vision_backbone: resnet18
-  pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1 #预训练的视觉编码器模型，一般来说会设置较小的lr_backbone进行微调，这里不设置，直接使用和unet一样的学习率
+  # pretrained_backbone_weights: ResNet18_Weights.IMAGENET1K_V1 #预训练的视觉编码器模型，一般来说会设置较小的lr_backbone进行微调，这里不设置，直接使用和unet一样的学习率
   use_group_norm: true                # 【新增】配合 Diffusion
   spatial_softmax_num_keypoints: 32   # 【新增】提取图片关键点，替代 ACT 的特征平铺
 

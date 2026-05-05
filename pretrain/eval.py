@@ -1,3 +1,12 @@
+import os
+# 告诉底层的 CuBLAS 使用固定的工作区配置，以保证计算的绝对确定性
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+# 🌟 终极防线：强行限制底层所有的数学库和物理引擎仅使用单线程！
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 import torch
 import logging
 import numpy as np
@@ -8,8 +17,8 @@ from pathlib import Path
 from contextlib import nullcontext
 import gymnasium as gym
 import yaml
-from pathlib import Path
 from tqdm import tqdm
+import random
 # ==========================================
 # 🌟 [新增] 自定义 Top-K 快照管理器(包含视频同步清理)
 # ==========================================
@@ -115,11 +124,18 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     fps = getattr(cfg_eval, "fps", 25)
     max_steps = getattr(cfg_eval, "max_steps", 300)
     raw_camera = getattr(cfg_eval, "render_camera", 'overhead_cam')
-    
     render_camera = raw_camera
+    # 从配置中提取基础种子，默认为 1000
+    base_seed = getattr(cfg_eval, "seed", 1000)
     # 动作执行循环
     for ep in tqdm(range(n_episodes), leave=False):
-        obs, _ = env.reset()
+        # 计算当前回合的专属种子，并传给环境
+        ep_seed = base_seed + ep
+        obs, _ = env.reset(seed=ep_seed)
+        # 🌟 核心修复 2：每个回合开始前，强制重置框架的随机状态
+        # 这样即使上一回合的执行步数有波动，也不会污染本回合的 Diffusion 采样噪声
+        torch.manual_seed(ep_seed)
+        np.random.seed(ep_seed)
         done = False
         frames = []
         ep_reward = 0
@@ -245,11 +261,38 @@ def evaluate_and_checkpoint_if_needed(
         else:
             logging.warning("⚠️ 警告: 未传入 train_loss，跳过 Top-K 模型清理逻辑，将保留所有权重。")
 
+
+def seed_everything(seed: int):
+    """Set seed for absolute reproducibility."""
+    
+    # 1. 锁死 Python 字典和集合的哈希种子 
+    # (防止字典遍历顺序在不同运行中发生变化，导致 Batch 数据错位)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+
+    # 2. 锁死 Python 内置随机库
+    random.seed(seed)
+
+    # 3. 锁死 Numpy
+    np.random.seed(seed)
+
+    # 4. 锁死 PyTorch (CPU & 所有 GPU)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) # 针对多卡环境
+
+    # 5. 锁死 CuDNN 底层算法 (极其关键)
+    # 关闭自动调优，强行使用确定性卷积算法
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # 6. 强制 PyTorch 使用确定性算子
+    # 如果底层调用了非确定性算子，会强制回退到确定性实现，或者抛出警告
+    torch.use_deterministic_algorithms(True, warn_only=True)
 # =========================================================================
 # 🌟 独立评估测试入口，推荐使用lerobot保存的快照格式，只需要给路径，环境配置会自动对齐
 # =========================================================================
 if __name__ == "__main__":
-    import os
     import sys
     import torch
     from types import SimpleNamespace
@@ -266,24 +309,28 @@ if __name__ == "__main__":
     # ==========================================
     eval_cfg = SimpleNamespace(
         # 📂 模型路径设置 (直接指向 0000600_loss=0.1540 文件夹即可，代码会自动寻找内部结构)
-        ckpt_path="outputs/finetune/train/2026-04-24/17-19-22_SewNeedle-2Arms-v0_ft_static_diffusion/checkpoints/000003_sr=0.30_reward=721.72",
+        ckpt_path="outputs/pretrain/train/2026-04-23/20-30-23_SewNeedle-2Arms-v0_pre_static_wrist_diffusion/checkpoints/0126000_loss=0.0042",
         # ⚙️ 评估参数设置
-        seed=100,
+        seed=101,
         n_episodes=100,             # 评估多少个任务                 
         max_episodes_rendered=10,  # 保存多少个视频 
         fps=25,                   # 视频帧率，和环境控制频率对齐
         max_steps=300,            # 每个任务的最大步数
         
         # 📷 相机设置
+        # ['zed_cam_left', 'zed_cam_right', 'overhead_cam', 'worms_eye_cam' , 'wrist_cam_left', 'wrist_cam_right'],
         render_camera=['overhead_cam']         # 保存video的相机视角              
     )
-    USE_AMP = True  
+    # 必须关闭 AMP 混合精度，防止 FP16 带来非确定性浮点误差！
+    USE_AMP = False
     # ==========================================
 
     def main():
         ckpt_path = eval_cfg.ckpt_path
         from lerobot.common.utils.utils import set_global_seed
-        set_global_seed(eval_cfg.seed)
+
+        seed_everything(eval_cfg.seed)
+        # set_global_seed(eval_cfg.seed)
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"❌ 找不到权重路径: {ckpt_path}\n请检查路径是否正确。")
         # ==========================================

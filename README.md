@@ -7,4 +7,5 @@
 4. 评估代码位于`pretrain/eval.py`，输入模型快照的路径即可，会自动读取训练时使用的policy配置参数，可以在`eval.py`设置`render_camera=['overhead_cam']`来设置录制视频的视角。
 5. 值得注意的是，这里用到了av-aloha的lerobot代码，换设备训练需要注意，后期可以注意更新为官网版本的lerobot
 ## ✨ Finetune部分 
-微调代码位于`finetune/train_finetune.py`，输入模型快照的路径即可，会自动读取训练时使用的policy配置参数
+1. 微调代码位于`finetune/train_finetune.py`，输入模型快照的路径即可，会自动读取训练时使用的policy配置参数
+2. 为了适配评估代码`pretrain/eval.py`，保存权重的同时生成了对应的训练参数配置表`config.yaml`和`config.json`

@@ -7,13 +7,12 @@ dataset_repo_id : "dppo_online_rollout"  # lerobot底层的logger需要这个进
 env:
   name : sim_envs
   task : SewNeedle-2Arms-v0
-  n_envs: 1                            # 并行环境数量
-  render_caera : ['overhead_cam']     # 评估时保存的video视角相机
+  n_envs: 1                            # 并行环境数量   
 
 training:
   # 预训练权重的绝对路径 (用来初始化 Actor)
   pretrained_ckpt_path: none
-  n_critic_warmup_itr: 2   # Critic 网络的预训练步数
+  n_critic_warmup_itr: 10   # Critic 网络的预训练步数
   # RL 训练步数与频率
   n_train_itr: 10000          # 总迭代轮数，微调通常不需要跑太久
   rollout_steps: 100          # 每次收集多少步数据再去更新
@@ -21,17 +20,17 @@ training:
   update_epochs: 10            # 收集完数据后，在这些数据上更新几轮网络  
 
   # 学习率 (微调时一定要极小，防止破坏预训练特征！)
-  actor_lr: 1e-5               # Diffusion 网络的学习率
+  actor_lr: 5e-6               # Diffusion 网络的学习率
   critic_lr: 3e-4              # Critic 网络的学习率 (通常比 Actor 大)
   
   # PPO 特有参数
   gamma: 0.99                  # 奖励折扣因子
   gae_lambda: 0.95             # GAE 优势计算参数
-  clip_ratio: 0.2              # PPO 截断范围
+  clip_ratio: 0.1              # PPO 截断范围
 
 eval:
   eval_freq: 1               # 评估频率
-  render_camera: ['overhead_cam']
+  render_camera: ['overhead_cam']  # 评估时保存的video视角相机
 
 policy:
   name: diffusion

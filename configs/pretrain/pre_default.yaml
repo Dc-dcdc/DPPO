@@ -42,7 +42,8 @@ eval:
   # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
   use_async_envs: true
   records_resume: true  # 是否读取top-k的快照和视频列表 即top_k_records.json
-  fps: 25                    # 录制的 MP4 视频帧率
+  fps: 25               # 录制的 MP4 视频帧率
+  seed: 1000            # 评估时的随机种子
   
 training:
   eval_freq: ???
