@@ -19,6 +19,7 @@ import gymnasium as gym
 import yaml
 from tqdm import tqdm
 import random
+import time
 # ==========================================
 # 🌟 [新增] 自定义 Top-K 快照管理器(包含视频同步清理)
 # ==========================================
@@ -127,6 +128,8 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     render_camera = raw_camera
     # 从配置中提取基础种子，默认为 1000
     base_seed = getattr(cfg_eval, "seed", 1000)
+    # 计算所有评估回合推理的总耗时
+    global_real_inference_times = []
     # 动作执行循环
     for ep in tqdm(range(n_episodes), leave=False):
         # 计算当前回合的专属种子，并传给环境
@@ -142,6 +145,8 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
         # LeRobot/DPPO 的 Policy 内置了 action chunking 队列
         policy.reset() # 清空模型的动作缓冲历史
 
+        # 🌟 1. 每回合新建一个列表，静默记录本回合的所有耗时
+        ep_inference_times = []
         for step in range(max_steps):
             # 1. 如果还在需要渲染的额度内，才调用渲染 (提升非渲染 episode 的评估速度)
             if ep < max_rendered:
@@ -150,23 +155,35 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
 
             # 2. 手动处理格式，将 Numpy 字典转为 Tensor 字典送入模型
             batch = {}
-            for k, v in obs.items():
-                v_safe = v.copy() # 强制在内存中拷贝一份连续的数据防报错
-                if "images" in k:
-                    # 图片：[C, H, W] -> [1, C, H, W] -> 归一化
-                    tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device) / 255.0
-                else:
-                    # 状态：[21] -> [1, 21]
-                    tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device)
-                batch[k] = tensor_v
+            # 🌟 修复：只提取模型 config 中真正需要的输入特征！
+            for k in policy.config.input_shapes.keys():
+                if k in obs:
+                    v_safe = obs[k].copy()
+                    if "images" in k:
+                        # 图片：[C, H, W] -> [1, C, H, W] -> 归一化
+                        tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device) / 255.0
+                    else:
+                        # 状态：[21] -> [1, 21]
+                        tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device)
+                    batch[k] = tensor_v
+            
+            # ==========================================
+            # ⏱️ 开始计时：使用高精度的 perf_counter
+            # ==========================================
+            start_time = time.perf_counter()
 
             # 3. 推理获取动作
             with torch.no_grad():
                 # 使用lerobot自带的推理函数
                 action = policy.select_action(batch) # 这里每次取出一个动作，推理依旧一次生成8个动作，只是一个个往外取
-            
-            # 4. 把模型输出的 Tensor 动作转回 Numpy
+            # 4. 把模型输出的 Tensor 动作转回 Numpy (包含在计时内)
             action_np = action.squeeze(0).cpu().numpy()
+
+            # ⏱️ 结束计时
+            inference_time_ms = (time.perf_counter() - start_time) * 1000 # 转换为毫秒 (ms)
+            ep_inference_times.append(inference_time_ms)
+            # print(f"👉 Step {step} 推理耗时: {inference_time_ms:.2f} ms")
+            # ==========================================
 
             # 5. 与环境交互
             obs, reward, terminated, truncated, info = env.step(action_np)
@@ -192,6 +209,24 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
             
             saved_video_paths.append(str(video_path))
 
+        # 记录每回合的推理时间
+        if len(ep_inference_times) > 0:
+            # 找到最大的卡顿时间（控制频率瓶颈）
+            max_time = max(ep_inference_times)
+            
+            # 过滤出“真实推理”步骤（比如耗时超过 5ms 的肯定是在跑网络，排除了 0.1ms 的出队操作）
+            real_inferences = [t for t in ep_inference_times if t > 5.0]
+            
+            if real_inferences:
+                global_real_inference_times.extend(real_inferences) # 加入全局统计
+            
+    if len(global_real_inference_times) > 0:
+        max_time = max(global_real_inference_times)
+        avg_real_time = sum(global_real_inference_times) / len(global_real_inference_times)
+        logging.info(f"⏱️ [总计{n_episodes}回合] 真实推理触发: {len(global_real_inference_times)} 次 | 峰值耗时: {max_time:.2f} ms | 平均耗时: {avg_real_time:.2f} ms")
+    else:
+        avg_real_time = 0.0  # 提供默认值防报错
+        max_time = 0.0
     policy.train() # 恢复训练模式
     
     # 计算实际应该返回的视频列表长度
@@ -199,7 +234,9 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     return {
         "aggregated": {
             "success_rate": float(np.mean(successes)),
-            "average_reward": float(np.mean(rewards))
+            "average_reward": float(np.mean(rewards)),
+            "avg_inference_ms": float(avg_real_time),
+            "max_inference_ms": float(max_time)
         },
         "video_paths": saved_video_paths
     }
@@ -220,7 +257,7 @@ def evaluate_and_checkpoint_if_needed(
         folder_identifier = step_identifier
     
     # 1. 评估逻辑 (优先读取 cfg.eval.eval_freq)
-    eval_freq = getattr(cfg.eval, "eval_freq", 0)
+    eval_freq = getattr(cfg.training, "eval_freq", 0)
     is_last_step = (step == cfg.training.offline_steps - 1)
     
     if (eval_freq > 0 and step > 0 and step % eval_freq == 0) or is_last_step:
@@ -240,7 +277,9 @@ def evaluate_and_checkpoint_if_needed(
             
             sr = eval_info["aggregated"]["success_rate"]
             ar = eval_info["aggregated"]["average_reward"]
-            logging.info(f"✅ 评估完毕! 成功率: {sr*100:.1f}%, 平均奖励: {ar:.2f}")
+            avg_infer = eval["aggregated"]["avg_inference_ms"]
+            max_infer = eval["aggregated"]["max_inference_ms"]
+            logging.info(f"✅ 评估完毕! 成功率: {sr*100:.1f}%, 平均奖励: {ar:.2f}, 推理平均耗时: {avg_infer:.2f} ms， 推理最大耗时: {max_infer:.2f} ms")
 
             if getattr(cfg, "wandb", {}).get("enable", False) and len(eval_info["video_paths"]) > 0:
                 logger.log_video(eval_info["video_paths"][0], step, mode="eval") # 只上传第一个视频到 wandb
@@ -309,10 +348,10 @@ if __name__ == "__main__":
     # ==========================================
     eval_cfg = SimpleNamespace(
         # 📂 模型路径设置 (直接指向 0000600_loss=0.1540 文件夹即可，代码会自动寻找内部结构)
-        ckpt_path="outputs/pretrain/train/2026-04-23/20-30-23_SewNeedle-2Arms-v0_pre_static_wrist_diffusion/checkpoints/0126000_loss=0.0042",
+        ckpt_path="outputs/pretrain/train/2026-05-07/01-38-24_SewNeedle-3Arms-v0_pre_zed_diffusion/checkpoints/134000_loss=0.0068",
         # ⚙️ 评估参数设置
         seed=101,
-        n_episodes=100,             # 评估多少个任务                 
+        n_episodes=50,             # 评估多少个任务                 
         max_episodes_rendered=10,  # 保存多少个视频 
         fps=25,                   # 视频帧率，和环境控制频率对齐
         max_steps=300,            # 每个任务的最大步数
@@ -327,10 +366,8 @@ if __name__ == "__main__":
 
     def main():
         ckpt_path = eval_cfg.ckpt_path
-        from lerobot.common.utils.utils import set_global_seed
 
         seed_everything(eval_cfg.seed)
-        # set_global_seed(eval_cfg.seed)
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"❌ 找不到权重路径: {ckpt_path}\n请检查路径是否正确。")
         # ==========================================
@@ -353,11 +390,34 @@ if __name__ == "__main__":
         # ==========================================
         print(f"💾 正在从目录重建网络并加载权重: {load_dir}")
         try:
-            #  直接使用 DiffusionPolicy 官方类，绕开所有版本不兼容的 API
-            from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
             
-            # 像加载常规 Hugging Face 模型一样，直接读取文件夹
-            policy = DiffusionPolicy.from_pretrained(load_dir)
+            # 1. 寻找 config.yaml (可能在 load_dir 下，也可能在它的父目录)
+            config_yaml_path = Path(load_dir) / "config.yaml"
+            if not config_yaml_path.exists():
+                config_yaml_path = Path(load_dir).parent / "config.yaml"
+                
+            if not config_yaml_path.exists():
+                raise FileNotFoundError(f"找不到 config.yaml，无法读取策略类型！")
+
+            # 2. 读取 YAML 并提取 policy.name
+            with open(config_yaml_path, "r", encoding="utf-8") as f:
+                full_cfg = yaml.safe_load(f)
+                policy_name = full_cfg.get("policy", {}).get("name", "").lower()
+                
+            # 3. 根据 policy_name 明确调用对应的类
+            if policy_name == "act":
+                print("🎯 检测到 ACT 模型，加载 ACTPolicy...")
+                from lerobot.common.policies.act.modeling_act import ACTPolicy
+                policy = ACTPolicy.from_pretrained(load_dir)
+                
+            elif policy_name == "diffusion":
+                print("🎯 检测到 Diffusion 模型，加载 DiffusionPolicy...")
+                # 直接使用 DiffusionPolicy 官方类，绕开所有版本不兼容的 API
+                from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
+                # 像加载常规 Hugging Face 模型一样，直接读取文件夹
+                policy = DiffusionPolicy.from_pretrained(load_dir)
+            else:
+                raise ValueError(f"❌ 未知的策略类型: {policy_name}。目前仅支持 act 或 diffusion。")
             
             # 手动推入 GPU
             policy.to(device)
@@ -426,7 +486,8 @@ if __name__ == "__main__":
         import shutil
         sr = eval_info["aggregated"]["success_rate"]
         ar = eval_info["aggregated"]["average_reward"]
-        
+        avg_infer = eval["aggregated"]["avg_inference_ms"]
+        max_infer = eval["aggregated"]["max_inference_ms"]
         # 生成直观的文件夹名称 (例如: eval_seed100_sr85.0_ar150.5)
         new_folder_name = f"eval_seed={eval_cfg.seed}_ep={eval_cfg.n_episodes}_sr={sr*100:.1f}_ar={ar:.2f}"
         new_videos_dir = os.path.join(videos_dir, new_folder_name)
@@ -448,6 +509,8 @@ if __name__ == "__main__":
         print(f"🎉 独立评估完成！")
         print(f"🏆 成功率 (Success Rate): {sr*100:.1f}%")
         print(f"💰 平均奖励 (Average Reward): {ar:.2f}")
+        print(f"🚀 平均推理时间 (Average Inference Time): {avg_infer:.2f} ms")
+        print(f"🚀 最大推理时间 (Max Inference Time): {max_infer:.2f} ms")
         print("="*50)
 
     # 启动

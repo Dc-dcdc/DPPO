@@ -354,8 +354,8 @@
                     <site name="middle_zed_cam_right_frame" pos="-0.03 0.00119254 -0.04325" quat="0 0.707107 0.707107 0"/>
                     <site name="middle_zed_cam_right_optical_frame" pos="-0.03 0.00119254 -0.04325" quat="0 0 0.707107 0.707107"/>
 
-                    <camera name="zed_cam_left" pos="0.03 0.00119254 -0.04325" euler="1.57079632679 0 3.14159265359" fovy="90" mode="fixed"/>
-                    <camera name="zed_cam_right" pos="-0.03 0.00119254 -0.04325" euler="1.57079632679 0 3.14159265359" fovy="90" mode="fixed"/> 
+                    <camera name="zed_cam_left" pos="0.03 0.00119254 -0.04325" euler="1.57079632679 0 3.14159265359" fovy="66.21" mode="fixed"/>
+                    <camera name="zed_cam_right" pos="-0.03 0.00119254 -0.04325" euler="1.57079632679 0 3.14159265359" fovy="66.21" mode="fixed"/> 
                   </body>
 
                 </body>

@@ -6,7 +6,7 @@ def inspect_lerobot_dataset():
     # 1. 配置参数 
     # ==========================================
     # 替换成你的实际 repo_id 或本地路径lerobot/aloha_sim_insertion_human
-    dataset_repo_id = "iantc104/gv_sim_sew_needle_2arms" 
+    dataset_repo_id = "iantc104/gv_sim_sew_needle_3arms" 
     
     # 传入你的 resolved_delta_timestamps（如果之前定义了的话）
     delta_timestamps = None 

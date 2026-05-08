@@ -24,7 +24,18 @@ ENVS = {
         "observation_height": 480,
         "observation_width": 640,
     },
-    
+
+    # ==========================================
+    #  插槽插入任务 (3臂)
+    # ==========================================
+    "sim_envs/SlotInsertion-3Arms-v0": {   
+        "entry_point": "env.sim_envs:SlotInsertionEnv",  # 指向你的文件路径和类名
+        "num_arms": 3,
+        "episode_length": 300,
+        "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
+        "observation_height": 480,
+        "observation_width": 640,
+    },
     # 💡 如果你有其他的任务（比如插孔），可以继续在这里添加：
     # "sim_envs/InsertPeg-3Arms-v0": {
     #     "entry_point": "env.sim_envs:InsertPegEnv",

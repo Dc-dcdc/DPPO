@@ -5,6 +5,14 @@ seed: 1000
 
 
 override_dataset_stats:
+  observation.images.zed_cam_left:
+    # stats from imagenet, since we use a pretrained vision model
+    mean: [[[0.485]], [[0.456]], [[0.406]]]  # (c,1,1)
+    std: [[[0.229]], [[0.224]], [[0.225]]]  # (c,1,1)
+  observation.images.zed_cam_right:
+    # stats from imagenet, since we use a pretrained vision model
+    mean: [[[0.485]], [[0.456]], [[0.406]]]  # (c,1,1)
+    std: [[[0.229]], [[0.224]], [[0.225]]]  # (c,1,1)
   observation.images.wrist_cam_left:
     # stats from imagenet, since we use a pretrained vision model
     mean: [[[0.485]], [[0.456]], [[0.406]]]  # (c,1,1)
@@ -17,15 +25,16 @@ override_dataset_stats:
 training:
   lr_scheduler: "cosine"    # 调度器策略：强烈推荐 "cosine" (余弦衰减)，让模型在末期平滑落地
   lr_warmup_steps: 2000      # 预热步数：模型刚开始是白纸，用 500 步慢慢把学习率升到 1e-4，防止梯度爆炸，一般设置为总步数的1-5%
-  offline_steps: 1000000      # 离线训练总步数
+  offline_steps: 500000      # 离线训练总步数
   online_steps: 0
   save_freq: 2000 # 每 5000 步保存一次模型快照
   eval_freq: 2000
   log_freq: 100
   save_checkpoint: true
   num_workers: 4   # Number of workers for the offline training dataloader.
-  batch_size: 16
+  batch_size: 32
   lr: 1e-4 # 学习率
+  lr_backbone: 1e-5    # 为骨干网络单独设置小学习率
   adam_betas: [0.9, 0.999]
   adam_eps: 1e-8
   weight_decay: 1e-6 # L2正则化
@@ -38,6 +47,8 @@ training:
     
     # 状态和图片向过去取 (例如 n_obs_steps 为 2)
     observation.state: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.zed_cam_left: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
+    observation.images.zed_cam_right: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
     observation.images.wrist_cam_left: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
     observation.images.wrist_cam_right: "[(-i) / ${env.fps} for i in reversed(range(${policy.n_obs_steps}))]"
 
@@ -55,9 +66,11 @@ policy:
   horizon : 16 # 推理总步数   一个horizon视为一个动作块
   n_action_steps: 8 # 执行的实际步数
   crop_shape: [384, 384] # 裁剪的图像尺寸
-  crop_is_random: false  # 强制进行中心裁剪，保证目标始终在视野内
+  crop_is_random: False  # 强制进行中心裁剪，保证目标始终在视野内
   input_shapes:
     # TODO(rcadene, alexander-soare): add variables for height and width from the dataset/env?
+    observation.images.zed_cam_left: [3, 480, 640]
+    observation.images.zed_cam_right: [3, 480, 640]
     observation.images.wrist_cam_left: [3, 480, 640]
     observation.images.wrist_cam_right: [3, 480, 640]
     observation.state: ["${env.state_dim}"]
@@ -66,6 +79,8 @@ policy:
 
   # Normalization / Unnormalization
   input_normalization_modes:
+    observation.images.zed_cam_left: mean_std
+    observation.images.zed_cam_right: mean_std
     observation.images.wrist_cam_left: mean_std
     observation.images.wrist_cam_right: mean_std
     observation.state: mean_std
@@ -99,8 +114,8 @@ policy:
   beta_start: 0.0001
   beta_end: 0.02
   prediction_type: epsilon            # 预测目标：噪声 (epsilon)
-  clip_sample: false
-  clip_sample_range: 1.0
+  clip_sample: false                  # 对输出值进行截断
+  clip_sample_range: 1.0              # 截断范围[-1,1]
 
   # ==========================================
   # 5. 推理与 EMA (Inference & EMA)

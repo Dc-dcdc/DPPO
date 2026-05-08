@@ -33,7 +33,7 @@ from lerobot.common.policies.utils import (
     populate_queues,
 )
 from finetune.critic import ImageCritic
-from pretrain.eval import custom_eval_policy, TopKCheckpointManager
+from pretrain.pre_eval import custom_eval_policy, TopKCheckpointManager
 from contextlib import nullcontext
 
 import torch

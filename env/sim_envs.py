@@ -21,7 +21,7 @@ CAMERAS = ['zed_cam_left', 'zed_cam_right', 'wrist_cam_left', 'wrist_cam_right',
 
 class GuidedVisionEnv(gym.Env):
 
-    metadata = {"render_modes": ["rgb_array"], "render_fps": 25}
+    metadata = {"render_modes": ["rgb_array"], "render_fps": 1/SIM_DT}
 
     def __init__(self, 
             xml_path: str,
@@ -32,19 +32,20 @@ class GuidedVisionEnv(gym.Env):
             observation_width: int = 640,
         ):
         super().__init__()
+        assert num_arms in [2, 3], f"Invalid number of arms: {num_arms}"
+        assert all([camera in CAMERAS for camera in cameras]), f"Invalid camera names: {cameras}"
         # self.num_envs = 1
         # ==========================================
         # 🌟 1. 加载物理模型
         # ==========================================
-        self._mjcf_root = mjcf.from_path(xml_path)  
+        self.cameras = cameras # 使用的摄像头列表
+        self.num_arms = num_arms
+        self._mjcf_root = mjcf.from_path(xml_path)
+        self._physics = mjcf.Physics.from_mjcf_model(self._mjcf_root)  
         self.observation_height = observation_height
         self.observation_width = observation_width   
         self._mjcf_root.option.timestep = SIM_PHYSICS_DT  
-        self._physics = mjcf.Physics.from_mjcf_model(self._mjcf_root) 
-        assert all([camera in CAMERAS for camera in cameras]), f"Invalid camera names: {cameras}"
-        self.cameras = cameras # 使用的摄像头列表
-        assert num_arms in [2, 3], f"Invalid number of arms: {num_arms}"
-        self.num_arms = num_arms
+        
         self.episode_length = episode_length
         self._middle_base_link = self._mjcf_root.find('body', MIDDLE_BASE_LINK)
         self._middle_base_link_init_pos = self._middle_base_link.pos.copy()
@@ -57,17 +58,24 @@ class GuidedVisionEnv(gym.Env):
         # ==========================================
         # 🌟 2. 构建观察空间 (Observation Space)
         # ==========================================
+        """
+        {
+            "observation.images.cam_1": Box(...),
+            "observation.images.cam_2": Box(...),
+            "observation.state": Box(...)
+        }
+        """
         obs_spaces = {}
         # 动态遍历并注册所有的相机图像空间
         for cam_name in self.cameras:
             # 这里的键名严格对齐 LeRobot 的规范：observation.images.xxxx
             obs_spaces[f'observation.images.{cam_name}'] = spaces.Box(
-                low=0, high=255, shape=(3, 480, 640), dtype=np.uint8
+                low=0, high=255, shape=(3, self.observation_height, self.observation_width), dtype=np.uint8
             )
             
         # 注册 21维本体状态
         obs_spaces['observation.state'] = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.num_joints,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.num_joints,), dtype=np.float64
         ) 
         
         self.observation_space = spaces.Dict(obs_spaces)
@@ -76,7 +84,7 @@ class GuidedVisionEnv(gym.Env):
         # 🌟 3. 定义动作空间 (Action Space): 21维关节目标角度
         # ==========================================
         self.action_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.num_joints,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.num_joints,), dtype=np.float64
         )   
         
         # ==========================================
@@ -124,9 +132,9 @@ class GuidedVisionEnv(gym.Env):
         middle_qpos = self._physics.bind(self._middle_joints).qpos.copy()
         
         if self.num_arms == 2:
-            agent_pos = np.concatenate([left_qpos, right_qpos]).astype(np.float32)
+            agent_pos = np.concatenate([left_qpos, right_qpos]).astype(np.float64)
         elif self.num_arms == 3:
-            agent_pos = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float32) 
+            agent_pos = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float64) 
         # state_21d = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float32)
 
         # ==========================================
@@ -137,7 +145,7 @@ class GuidedVisionEnv(gym.Env):
         for cam_name in self.cameras:
             # 注意：这里的 camera_id 必须和你的 XML 文件里 <camera name="..."> 的名字完全一致！
             try:
-                img = self._physics.render(height=480, width=640, camera_id=cam_name)
+                img = self._physics.render(height=self.observation_height, width=self.observation_width, camera_id=cam_name)
                 img = np.transpose(img, (2, 0, 1))# 转换通道 (H, W, C) -> (C, H, W)
                 # 存入字典，键名严格对齐
                 obs_dict[f'observation.images.{cam_name}'] = img
@@ -180,8 +188,10 @@ class GuidedVisionEnv(gym.Env):
         
         # 2. 动作拆包
         left_joints = action[:6]
+        # left_gripper = action[6]
         left_gripper = np.clip(action[6], 0.0, 1.0) # 0.0 到 1.0 之间的归一化值
         right_joints = action[7:13]
+        # right_gripper = action[13]
         right_gripper = np.clip(action[13], 0.0, 1.0)
         if self.num_arms == 3:
             middle_joints = action[14:21]
@@ -223,12 +233,12 @@ class GuidedVisionEnv(gym.Env):
         
         try:
             # MuJoCo 的 render 默认输出的就是标准的 (H, W, C) rgb_array
-            img = self._physics.render(height=480, width=640, camera_id=render_cam)
+            img = self._physics.render(height=self.observation_height, width=self.observation_width, camera_id=render_cam)
             return img
         except Exception as e:
             # 防止万一没找到相机导致崩溃
             print(f"⚠️ 渲染视频帧失败: {e}")
-            return np.zeros((480, 640, 3), dtype=np.uint8)
+            return np.zeros((self.observation_height, self.observation_width, 3), dtype=np.uint8)
         
     def render_viewer(self):
         if self._viewer is None:
@@ -468,8 +478,97 @@ class SewNeedleEnv(GuidedVisionEnv):
                         reward += 500.0 
                         self.terminated = True
 
-
         return float(reward)
+
+
+class SlotInsertionEnv(GuidedVisionEnv):
+    def __init__(self, **kwargs):
+        xml = os.path.join(XML_DIR, 'task_slot_insertion.xml')
+        super().__init__(xml, **kwargs)
+
+        self.max_reward = 4
+
+        self._slot_joint = self._mjcf_root.find('joint', 'slot_joint')
+        self._stick_joint = self._mjcf_root.find('joint', 'stick_joint')
+
+    def reset(self, seed=None, options=None) -> tuple:
+        super().reset(seed=seed, options=options)
+
+        # reset physics
+        x_range = [-0.05, 0.05]
+        y_range = [0.1, 0.15]
+        z_range = [0.0, 0.0]
+        ranges = np.vstack([x_range, y_range, z_range])
+        slot_position = np.random.uniform(ranges[:, 0], ranges[:, 1])
+        slot_quat = np.array([1, 0, 0, 0])
+
+
+        peg_position = np.random.uniform(ranges[:, 0], ranges[:, 1])
+        peg_quat = np.array([1, 0, 0, 0])
+
+        x_range = [-0.08, 0.08]
+        y_range = [-0.1, 0.0]
+        z_range = [0.0, 0.0]
+        ranges = np.vstack([x_range, y_range, z_range])
+        stick_position = np.random.uniform(ranges[:, 0], ranges[:, 1])
+        stick_quat = np.array([1, 0, 0, 0]) 
+
+        self._physics.bind(self._slot_joint).qpos = np.concatenate([slot_position, slot_quat])
+        self._physics.bind(self._stick_joint).qpos = np.concatenate([stick_position, stick_quat])
+
+        self._physics.forward()
+
+        observation = self.get_obs()
+        info = {"is_success": False}
+
+        return observation, info
+    
+
+    def get_reward(self):
+
+        touch_left_gripper = False
+        touch_right_gripper = False
+        stick_touch_table = False
+        stick_touch_slot = False
+        pins_touch = False
+
+        # return whether peg touches the pin
+        contact_pairs = []
+        for i_contact in range(self._physics.data.ncon):
+            id_geom_1 = self._physics.data.contact[i_contact].geom1
+            id_geom_2 = self._physics.data.contact[i_contact].geom2
+            geom1 = self._physics.model.id2name(id_geom_1, 'geom')
+            geom2 = self._physics.model.id2name(id_geom_2, 'geom')
+            contact_pairs.append((geom1, geom2))
+            contact_pairs.append((geom2, geom1))
+
+        for geom1, geom2 in contact_pairs:
+            if geom1 == "stick" and geom2.startswith("right"):
+                touch_right_gripper = True
+            
+            if geom1 == "stick" and geom2.startswith("left"):
+                touch_left_gripper = True
+
+            if geom1 == "table" and geom2 == "stick":
+                stick_touch_table = True
+
+            if geom1 == "stick" and geom2.startswith("slot-"):
+                stick_touch_slot = True
+
+            if geom1 == "pin-stick" and geom2 == "pin-slot":
+                pins_touch = True
+
+        reward = 0
+        if touch_left_gripper and touch_right_gripper: # touch both
+            reward = 1
+        if touch_left_gripper and touch_right_gripper and (not stick_touch_table): # grasp stick
+            reward = 2
+        if stick_touch_slot and (not stick_touch_table): # peg and socket touching
+            reward = 3
+        if pins_touch: # successful insertion
+            reward = 4
+        return reward
+
 
 # ==========================================
 # 本地测试代码 (确保环境逻辑完美运行)

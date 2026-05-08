@@ -33,24 +33,27 @@ seed: ???
 # "dataset_index" into the returned item. The index mapping is made according to the order in which the
 # datsets are provided.
 dataset_repo_id: lerobot/pusht
-video_backend: pyav
+video_backend: pyav # 视频解码引擎，读取视频文件转化为图像张量
 
 eval:
-  n_episodes: 1
+  n_episodes: 10             # 每次评估跑多少个完整的 episode
+  max_episodes_rendered: 4   # 最多保存前几个 episode 的录像视频
   # `batch_size` specifies the number of environments to use in a gym.vector.VectorEnv.
   batch_size: 1
   # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
   use_async_envs: true
   records_resume: true  # 是否读取top-k的快照和视频列表 即top_k_records.json
   fps: 25               # 录制的 MP4 视频帧率
-  seed: 1000            # 评估时的随机种子
-  
+  seed: 100            # 评估时的随机种子
+  render_camera : ['overhead_cam']                           # 评估时保存的video视角相机
+
+
 training:
-  eval_freq: ???
-  log_freq: 100 # 多少步记录一次日志，会在终端输出，并上传wandb
+  eval_freq: 100
+  log_freq: 100           # 多少步记录一次日志，会在终端输出，并上传wandb
   save_checkpoint: true 
-  max_checkpoints: 10  # 最多保存loss最小的几个模型快照
-  lr_backbone: 1e-5 # 视觉网络resnet学习率
+  max_checkpoints: 10     # 最多保存loss最小的几个模型快照
+  lr_backbone: 1e-5       # 视觉网络resnet学习率
 
   image_transforms:
   # These transforms are all using standard torchvision.transforms.v2
@@ -70,7 +73,7 @@ training:
     max_num_transforms: 3
     # By default, transforms are applied in Torchvision's suggested order (shown below).
     # Set this to True to apply them in a random order.
-    random_order: false
+    random_order: true
     brightness:
       weight: 1
       min_max: [0.8, 1.2]

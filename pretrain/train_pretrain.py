@@ -12,7 +12,6 @@ import shutil  # 用于删除多余的模型文件夹
 from contextlib import nullcontext
 from pathlib import Path
 from pprint import pformat
-from itertools import cycle  #  使用 Python 原生的循环迭代器，更轻量
 
 from eval import  evaluate_and_checkpoint_if_needed,TopKCheckpointManager
 
@@ -26,7 +25,8 @@ from torch.utils.data import DataLoader
 # 🌟 采用官方最新极简 API，抛弃 factory.py
 # ==========================================
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
-
+from lerobot.common.datasets.sampler import EpisodeAwareSampler
+from lerobot.common.datasets.transforms import get_image_transforms
 # 复用 LeRobot 的其他核心组件
 from lerobot.common.logger import Logger
 from lerobot.common.policies.factory import make_policy # 用于获取训练策略模型
@@ -38,7 +38,6 @@ from lerobot.common.utils.utils import (
     init_logging,
     set_global_seed,
 )
-
 
 
 
@@ -66,10 +65,35 @@ def make_optimizer_and_scheduler(cfg, policy):
         )
         lr_scheduler = None
     elif cfg.policy.name == "diffusion":
+        # 🌟 修复：分离视觉 Backbone 和 U-Net 的学习率，并将所有参数纳入优化器
+        optimizer_params_dicts = [
+            {
+                "params": [
+                    p
+                    for n, p in policy.named_parameters()
+                    # 假设非 backbone 的参数（即 UNet 和相关投影层）
+                    if not n.startswith("model.backbone") and not n.startswith("image_encoder") and p.requires_grad
+                ]
+            },
+            {
+                "params": [
+                    p
+                    for n, p in policy.named_parameters()
+                    # 抓取视觉编码器的参数
+                    if (n.startswith("model.backbone") or n.startswith("image_encoder") or n.startswith("visual_encoders")) and p.requires_grad
+                ],
+                # 视觉网络给予 10 倍小的学习率，保护预训练特征
+                "lr": getattr(cfg.training, "lr_backbone", 1e-5), 
+            },
+        ]
+
         #对于扩散模型（diffusion model），我们使用了Adam优化器来更新模型的参数
         optimizer = torch.optim.Adam(
-            policy.diffusion.parameters(),
+            # policy.diffusion.parameters(),
+            optimizer_params_dicts,
             lr=cfg.training.lr,
+            betas=cfg.training.adam_betas,
+            eps=cfg.training.adam_eps,
             weight_decay=cfg.training.weight_decay,
         )
         from diffusers.optimization import get_scheduler
@@ -289,7 +313,7 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
         raise ValueError("配置文件`delta_timestamps` 中缺失了最核心的 `action` 时间轴！\n")
         
     # ⚠️ 软警告（可选）：Diffusion 通常还需要历史视觉帧，如果没写，可以给个黄字警告
-    if not any("images" in k for k in delta_timestamps_dict.keys()):
+    if cfg.policy.name == "diffusion" and not any("images" in k for k in delta_timestamps_dict.keys()):
         import logging
         logging.warning("警告: 你的 `delta_timestamps` 中没有包含任何图片的过去时间帧。\n")
 
@@ -327,8 +351,25 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # 🌟 1. 动态构建时间戳与挂载数据集
     # ==========================================
     logging.info("📦 正在挂载离线专家数据集...")
-    
-    # 解析配置文件中的时间戳
+    image_transforms = None
+    # 色彩/像素级增强，对图像添加光亮色彩等随机扰动
+    if cfg.training.image_transforms.enable:
+        cfg_tf = cfg.training.image_transforms
+        image_transforms = get_image_transforms(
+            brightness_weight=cfg_tf.brightness.weight,
+            brightness_min_max=cfg_tf.brightness.min_max,
+            contrast_weight=cfg_tf.contrast.weight,
+            contrast_min_max=cfg_tf.contrast.min_max,
+            saturation_weight=cfg_tf.saturation.weight,
+            saturation_min_max=cfg_tf.saturation.min_max,
+            hue_weight=cfg_tf.hue.weight,
+            hue_min_max=cfg_tf.hue.min_max,
+            sharpness_weight=cfg_tf.sharpness.weight,
+            sharpness_min_max=cfg_tf.sharpness.min_max,
+            max_num_transforms=cfg_tf.max_num_transforms,
+            random_order=cfg_tf.random_order,
+        )
+    # # 解析配置文件中的时间戳
     resolved_delta_timestamps = get_resolved_delta_timestamps(cfg)
     logging.info(f"⏱️ 解析到的动作时间轴: {resolved_delta_timestamps.get('action', [])[:5]} ...")
     logging.info(f"⏱️ 解析到的视觉时间轴: {resolved_delta_timestamps.get('observation.state', [])}")
@@ -336,9 +377,15 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     
     offline_dataset = LeRobotDataset(
         repo_id=cfg.dataset_repo_id, #根据id下载或者加载本地数据（/home/dc/.cache/huggingface/datasets）
-        delta_timestamps=resolved_delta_timestamps
+        delta_timestamps=resolved_delta_timestamps,
+        video_backend=cfg.video_backend,
+        image_transforms=image_transforms,
     )
-
+    # # 使用官方函数解析并挂载到 cfg，这样 make_dataset 内部才能正确读取
+    # resolve_delta_timestamps(cfg)
+    
+    # # 必须使用 make_dataset 以激活 ACT 依赖的 image_transforms
+    # offline_dataset = make_dataset(cfg)
     # ==========================================
     # 🌟 2. 断点续训：路径校验与防雷处理
     # ==========================================
@@ -441,11 +488,25 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # ==========================================
     # 🌟 5. 构建标准的高并发数据加载器 (彻底解耦)
     # ==========================================
+    # 如果配置中指定了丢弃最后n帧数据，就使用EpisodeAwareSampler采样器，并且不进行shuffle，这样可以确保在每个训练周期内，模型不会看到每个episode的最后n帧数据，
+    # 这对于某些任务可能有帮助，比如那些episode的最后几帧可能包含一些特殊的状态或者奖励信号，丢弃它们可以让模型更好地学习到一般性的行为模式。
+    if cfg.training.get("drop_n_last_frames"): 
+        shuffle = False
+        sampler = EpisodeAwareSampler( 
+            offline_dataset.episode_data_index,
+            drop_n_last_frames=cfg.training.get("drop_n_last_frames"),
+            shuffle=True,
+        )
+    else:
+        shuffle = True
+        sampler = None
+
     dataloader = DataLoader(
         offline_dataset,
         num_workers=cfg.training.num_workers,
         batch_size=cfg.training.batch_size,
-        shuffle=True, # 开启全局打乱
+        shuffle=shuffle,         # 开启全局打乱
+        sampler=sampler,                   
         pin_memory=(device.type != "cpu"),
         drop_last=True, # 开启丢弃最后一个不完整的批次
     )
@@ -472,11 +533,11 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     env_id = f"{cfg.env.name}/{cfg.env.task}" 
     
     logging.info(f"正在通过 Gym 注册表构建环境: {env_id}")
-    
+
     # 使用 gym.make 创建环境，并通过 kwargs 强行覆盖你需要的相机
     eval_env = gym.make(
         id=env_id, 
-        cameras=obs_cameras  # 👈 这里的传参会直接覆盖 __init__.py 里的默认套餐！
+        cameras=obs_cameras,  # 👈 这里的传参会直接覆盖 __init__.py 里的默认套餐！
     )
     logging.info(f"✅ 环境加载成功！最终挂载的相机: {obs_cameras}")
 
@@ -550,10 +611,10 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
-        "env=sim_sew_needle_2arms", # 环境，这俩定义在default文件中
-        "policy=pre_wrist_diffusion", # 策略
-        "resume=true",
-        "resume_path='outputs/pretrain/train/2026-04-27/19-17-50_SewNeedle-2Arms-v0_pre_wrist_diffusion/checkpoints/0284000_loss=0.0045'",
+        "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
+        "policy=pre_zed_diffusion", # 策略
+        "resume=false",
+        "resume_path='outputs/pretrain/train/2026-05-05/21-48-33_SewNeedle-3Arms-v0_pre_zed_diffusion/checkpoints/182000_loss=0.0518'",
         "training.batch_size=16",
         "training.num_workers=4",
         "wandb.enable=FaLse" ,
