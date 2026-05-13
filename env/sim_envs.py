@@ -573,36 +573,232 @@ class SlotInsertionEnv(GuidedVisionEnv):
 # ==========================================
 # 本地测试代码 (确保环境逻辑完美运行)
 # ==========================================
+# ==========================================
+# 本地测试代码：加载 LeRobot 策略网络进行实时可视化推理
+# ==========================================
+# ==========================================
+# 本地测试代码：加载 LeRobot 策略网络进行实时可视化推理 (支持多相机画面拼接)
+# ==========================================
 if __name__ == '__main__':
+    import os
+    import yaml
+    import torch
+    import time
+    from pathlib import Path
+    import mujoco.viewer
+    import cv2       
+    import numpy as np
+
+    # ==========================================
+    # 🎯 1. 设置权重路径与加载
+    # ==========================================
+    ckpt_path = "outputs/pretrain/train/2026-05-13/12-12-14_SewNeedle-3Arms-v0_pre_zed_diffusion/checkpoints/078000_loss=0.0052_sr=50.0_ar=323.18"
+    
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"⚠️ 找不到权重路径: {ckpt_path}\n请修改为正确的 ckpt_path。")
+
+    hf_model_dir = os.path.join(ckpt_path, "pretrained_model")
+    load_dir = hf_model_dir if os.path.exists(hf_model_dir) else ckpt_path
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🚀 初始化推理程序... 使用设备: {device}")
+
+    config_yaml_path = Path(load_dir) / "config.yaml"
+    if not config_yaml_path.exists():
+        config_yaml_path = Path(load_dir).parent / "config.yaml"
+        
+    with open(config_yaml_path, "r", encoding="utf-8") as f:
+        full_cfg = yaml.safe_load(f)
+        policy_name = full_cfg.get("policy", {}).get("name", "").lower()
+
+    if policy_name == "act":
+        print("🎯 加载 ACT 模型...")
+        from lerobot.common.policies.act.modeling_act import ACTPolicy
+        policy = ACTPolicy.from_pretrained(load_dir)
+    elif policy_name == "diffusion":
+        print("🎯 加载 Diffusion 模型...")
+        from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
+        policy = DiffusionPolicy.from_pretrained(load_dir)
+
+    policy.to(device)
+    policy.eval()
+
+    # ==========================================
+    # 🎯 2. 初始化环境与相机配置
+    # ==========================================
+    all_obs_keys = policy.config.input_shapes.keys()
+    obs_cameras = [k.replace("observation.images.", "") for k in all_obs_keys if "observation.images." in k]
+    
     print("🚀 初始化 SewNeedle 环境...")
-    env = SewNeedleEnv(cameras=['zed_cam_left', 'zed_cam_right'])
+    env = SewNeedleEnv(cameras=obs_cameras)
     obs, info = env.reset()
-    
-    print("✅ 环境初始化成功！")
-    print(f"📷 左目相机输出维度: {obs['observation.images.zed_cam_left'].shape} (应为 3, 480, 640)")
-    print(f"🤖 关节状态输出维度: {obs['observation.state'].shape} (应为 21,)")
-    
-    # 获取初始夹爪状态，确保它们是归一化的 (0到1之间)
-    left_gripper_state = obs['observation.state'][6]
-    right_gripper_state = obs['observation.state'][13]
-    
-    print("\n▶️ 开始执行 100 步随机游走测试...")
-    while True:
+    policy.reset()
+
+    # 🌟 新增：配置需要额外拼接渲染显示的相机列表
+    # 选项参考 CAMERAS 列表: ['zed_cam_left', 'zed_cam_right', 'wrist_cam_left', 'wrist_cam_right', 'overhead_cam', 'worms_eye_cam']
+    display_cameras = ['zed_cam_left', 'zed_cam_right', 'wrist_cam_left', 'wrist_cam_right', 'overhead_cam', 'worms_eye_cam']
+    print(f"📺 将在 OpenCV 窗口中实时拼接显示以下相机: {display_cameras}")
+
+    # ==========================================
+    # 🎯 3. 键盘控制逻辑与 MuJoCo Viewer 接管
+    # ==========================================
+    global_cmd = {
+        "run_policy": False,
+        "force_reset": False
+    }
+
+    def key_callback(keycode):
+        if keycode == 32:  # Space
+            global_cmd["force_reset"] = True
+        elif keycode == 80 or keycode == 112:  # P 或 p
+            if not global_cmd["run_policy"]:
+                print("▶️ [键盘指令] 开始策略推理...")
+                global_cmd["run_policy"] = True
+
+    viewer = mujoco.viewer.launch_passive(
+        env._physics.model.ptr, 
+        env._physics.data.ptr,
+        show_left_ui=True, 
+        show_right_ui=True,
+        key_callback=key_callback
+    )
+
+    print("\n" + "="*50)
+    print("🎮 交互控制说明 (在 3D 窗口或 监控窗口 均可按键):")
+    print("👉 按下 [P] 键: 开始策略推理与运动控制")
+    print("👉 按下 [空格] 键: 强制中断结算，重置环境到初始状态")
+    print("="*50 + "\n")
+
+    episode_reward = 0.0
+    steps = 0
+
+    # ==========================================
+    # 🎯 4. 步进主循环
+    # ==========================================
+    window_name = f"Multi-Camera Monitor"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    # 强制设定 OpenCV 窗口在桌面上的初始大小 (宽, 高)
+    cv2.resizeWindow(window_name, 1280, 480)
+    while viewer.is_running():
         step_start = time.time()
 
-        # 生成合法的随机动作并执行
-        # random_action = env.action_space.sample()
-        # obs, reward, terminated, truncated, info = env.step(random_action)
-        
-        # 启动可视化窗口
-        env.render_viewer()
+        # ------------------------------------
+        # 响应中断：强制重置
+        # ------------------------------------
+        if global_cmd["force_reset"]:
+            print(f"⏹️ [键盘指令] 强制重置！当前进度: 步数 {steps}, 奖励 {episode_reward:.2f}")
+            obs, info = env.reset()
+            policy.reset()  
+            episode_reward = 0.0
+            steps = 0
+            global_cmd["force_reset"] = False
+            global_cmd["run_policy"] = False  
 
-        # if terminated or truncated:
-        #     print(f"🎉 任务在第 {i} 步完成！获得了最大奖励 {reward}")
-        #     obs, info = env.reset()
+        # ------------------------------------
+        # 正常策略执行
+        # ------------------------------------
+        if global_cmd["run_policy"]:
+            batch = {}
+            for k in policy.config.input_shapes.keys():
+                if k in obs:
+                    v_safe = obs[k].copy()
+                    if "images" in k:
+                        tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device) / 255.0
+                    else:
+                        tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device)
+                    batch[k] = tensor_v
 
+            with torch.no_grad():
+                action_tensor = policy.select_action(batch) 
+            action = action_tensor.squeeze(0).cpu().numpy()
+
+            try:
+                obs, reward, terminated, truncated, info = env.step(action)
+                episode_reward += float(reward)
+                steps += 1
+            except Exception as e:
+                print(f"💥 物理引擎异常中断: {e}")
+                terminated = True 
+
+            if terminated or truncated:
+                reason = "成功" if terminated else "超时/失败"
+                print(f"🔄 回合自然结束 ({reason})！总步数: {steps}, 累计奖励: {episode_reward:.2f}")
+                obs, info = env.reset()
+                policy.reset() 
+                episode_reward = 0.0
+                steps = 0
+                global_cmd["run_policy"] = False  
+
+        # ------------------------------------
+        # 🌟 实时渲染并拼接多个相机画面
+        # ------------------------------------
+        try:
+            frames_bgr = []
+            for cam_name in display_cameras:
+                # 渲染单个相机
+                img_rgb = env._physics.render(height=480, width=640, camera_id=cam_name)
+                img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+                
+                # 在画面左上角写上该相机的名字，用于区分
+                cv2.putText(img_bgr, cam_name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                frames_bgr.append(img_bgr)
+
+            # 如果列表有图像，将它们水平拼接 (hstack)
+            if frames_bgr:
+                max_cols = 2  # 👈 在这里设置一行最多放几个画面
+                grid_rows = []
+                
+                # 按照 max_cols 将画面分组
+                for i in range(0, len(frames_bgr), max_cols):
+                    row_frames = frames_bgr[i:i + max_cols]
+                    
+                    # 补齐逻辑：如果最后一行画面数量不足 max_cols，用黑屏画面占位，防止拼接报错
+                    while len(row_frames) < max_cols:
+                        blank_img = np.zeros_like(frames_bgr[0])
+                        row_frames.append(blank_img)
+                        
+                    # 水平拼接这一行的图像
+                    grid_rows.append(np.hstack(row_frames))
+
+                # 垂直拼接所有行，形成最终的网格
+                combined_img = np.vstack(grid_rows)
+                h, w = combined_img.shape[:2]
+                # 叠加全局进度信息 (左下角)
+                cv2.putText(combined_img, f"Step: {steps} | Reward: {episode_reward:.2f}", (20, h - 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+                # 如果未运行策略，在整个拼接画面的中央叠加暂停大字提示
+                if not global_cmd["run_policy"]:
+                    text = "PAUSED - Press 'P' to Start"
+                    text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
+                    text_x = (w - text_size[0]) // 2
+                    text_y = (h + text_size[1]) // 2
+                    cv2.putText(combined_img, text, (text_x, text_y), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
+
+                # 显示最终拼接好的图像
+                cv2.imshow(window_name, combined_img)
+            
+            # 监听 OpenCV 窗口按键
+            cv_key = cv2.waitKey(1) & 0xFF
+            if cv_key == ord(' '):  # 空格键
+                global_cmd["force_reset"] = True
+            elif cv_key == ord('p') or cv_key == ord('P'):  # P键
+                if not global_cmd["run_policy"]:
+                    print("▶️ [监控窗口指令] 开始策略推理...")
+                    global_cmd["run_policy"] = True
+
+        except Exception as e:
+            # 忽略初始第一帧可能的渲染错误
+            pass
+
+        # ------------------------------------
+        # 同步与帧率控制
+        # ------------------------------------
+        viewer.sync()
         time_until_next_step = SIM_DT - (time.time() - step_start)
-        time.sleep(max(0, time_until_next_step))
+        if time_until_next_step > 0:
+            time.sleep(time_until_next_step)
 
-    print("✅ 步进测试通过！环境可以交付 PPO 和 LeRobot 进行训练了。")
+    # 窗口关闭后清理资源
+    cv2.destroyAllWindows()
     env.close()

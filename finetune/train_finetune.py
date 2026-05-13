@@ -33,7 +33,7 @@ from lerobot.common.policies.utils import (
     populate_queues,
 )
 from finetune.critic import ImageCritic
-from pretrain.pre_eval import custom_eval_policy, TopKCheckpointManager
+from pretrain.eval import custom_eval_policy, TopKCheckpointManager
 from contextlib import nullcontext
 
 import torch
@@ -344,10 +344,13 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     eval_env = gym.make(id=env_id, cameras=obs_cameras)
     
     # 初始化 Top-K 快照管理器 (比如最多保留表现最好的 3 个模型)
-    max_checkpoints = getattr(cfg.eval, "max_checkpoints", 3)
+    max_checkpoints = getattr(cfg.eval, "max_checkpoints", 5)
     records_resume = getattr(cfg.eval, "records_resume", True)
-    ckpt_manager = TopKCheckpointManager(out_dir=out_dir, max_keep=max_checkpoints, records_resume=records_resume)
-
+    checkpoint_metric = getattr(cfg.eval, "loss", True)
+    manager = TopKCheckpointManager(out_dir=out_dir, 
+                                    max_keep=max_checkpoints, 
+                                    records_resume=records_resume, 
+                                    metric=checkpoint_metric)
     # ==========================================
     # 5. 初始化优化器与超参数
     # ==========================================
@@ -921,7 +924,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             # 5. 交给 TopKCheckpointManager 进行同步清理
             # 💡 核心技巧：因为 manager 的逻辑是 loss 越小越保留 (从小到大排序)
             # 我们想保留 Average Reward 最高的，所以传入负的 reward (-ar) 作为假 loss
-            ckpt_manager.update(step=itr+1, loss=-ar, ckpt_path=ckpt_path)
+            manager.update(step=itr+1, loss=-ar, ckpt_path=ckpt_path)
 
 
 @hydra.main(version_base="1.2", config_name="ft_default", config_path="../configs/finetune")

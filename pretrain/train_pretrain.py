@@ -141,7 +141,7 @@ def update_policy(
     # ==========================================
     # 1. 向前传播计算loss
     # ==========================================
-    with torch.autocast(device_type=device.type) if use_amp else nullcontext(): # 如果 use_amp = True，它会开启 torch.autocast，意味着接下来的计算会自动在 Float32 和 Float16 之间切换，省显存且加速
+    with torch.autocast(device_type=device.type, dtype=torch.bfloat16) if use_amp else nullcontext(): # 如果 use_amp = True，它会开启 torch.autocast，意味着接下来的计算会自动在 Float32 和 Float16 之间切换，省显存且加速
         output_dict = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
         loss = output_dict["loss"]
@@ -436,7 +436,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         
         try:
             # 1. 一次性读取整个综合大字典，全部丢到内存(CPU)里准备分发
-            checkpoint_dict = torch.load(training_state_file, map_location="cpu")
+            checkpoint_dict = torch.load(training_state_file, map_location="cpu", weights_only=False)
 
             # 2. 恢复 Optimizer
             if "optimizer" in checkpoint_dict:
@@ -544,9 +544,13 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # ==========================================
     # 🌟 6. DPPO 预训练主循环
     # ==========================================
-    max_checkpoints = getattr(cfg.training, "max_checkpoints", 5)
+    max_checkpoints = getattr(cfg.eval, "max_checkpoints", 5)
     records_resume = getattr(cfg.eval, "records_resume", True)
-    manager = TopKCheckpointManager(out_dir=out_dir, max_keep=max_checkpoints, records_resume=records_resume)
+    checkpoint_metric = getattr(cfg.eval, "checkpoint_metric", "loss")
+    manager = TopKCheckpointManager(out_dir=out_dir, 
+                                    max_keep=max_checkpoints, 
+                                    records_resume=records_resume, 
+                                    metric=checkpoint_metric)
     policy.train()
     logging.info("🔥 开始 DPPO 预训练 (模仿学习阶段)...")
     
@@ -558,8 +562,9 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         batch = next(dl_iter) # 取出一个batch的数据
         dataloading_s = time.perf_counter() - start_time # 计算数据加载时间
         for key in batch: # 这里的key对应的是类别，如action/observation
-            # 最好加上非阻塞传输non_blocking，并确保原有的引用随着循环覆盖而消失
-            batch[key] = batch[key].to(device, non_blocking=True)
+            if isinstance(batch[key], torch.Tensor):
+                # 最好加上非阻塞传输non_blocking，并确保原有的引用随着循环覆盖而消失
+                batch[key] = batch[key].to(device, non_blocking=True)
 
         # 前向传播、Loss 计算、反向传播与 EMA 更新
         train_info = update_policy(
@@ -614,10 +619,10 @@ if __name__ == "__main__":
         "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
         "policy=pre_zed_diffusion", # 策略
         "resume=false",
-        "resume_path='outputs/pretrain/train/2026-05-05/21-48-33_SewNeedle-3Arms-v0_pre_zed_diffusion/checkpoints/182000_loss=0.0518'",
+        "resume_path='outputs/pretrain/train/2026-05-08/12-14-28_SewNeedle-3Arms-v0_pre_zed_diffusion/checkpoints/136000_loss=0.0066_sr=30.0_ar=139.05'",
         "training.batch_size=16",
         "training.num_workers=4",
-        "wandb.enable=FaLse" ,
+        "wandb.enable=false", # 关闭 wandb，不需要aLse" ,
     ]
     
     for arg in default_args:
