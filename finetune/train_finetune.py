@@ -19,6 +19,7 @@ from pprint import pformat
 from lerobot.common.logger import Logger
 from tqdm import tqdm
 from collections import deque
+from lerobot.common.policies.factory import make_policy
 # 路径处理
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
@@ -236,10 +237,28 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         load_dir = ckpt_path # 兼容其他保存格式
     logging.info(f"💾 正在从目录重建网络并加载权重: {load_dir}")
     try:
-        # 直接使用 DiffusionPolicy 官方类加载权重
-        actor = DiffusionPolicy.from_pretrained(load_dir)
-        actor.to(device)  # 手动推入 GPU
+        from pathlib import Path
+        from lerobot.common.utils.utils import init_hydra_config
 
+        # 1. 寻找 config.yaml 路径
+        config_yaml_path = Path(load_dir) / "config.yaml"
+        if not config_yaml_path.exists():
+            config_yaml_path = Path(load_dir).parent / "config.yaml"
+            
+        if not config_yaml_path.exists():
+            raise FileNotFoundError(f"找不到 config.yaml，无法初始化 hydra_cfg！")
+
+        # 2. 根据 yaml 文件初始化 hydra_cfg 对象
+        hydra_cfg = init_hydra_config(str(config_yaml_path))
+
+        # 3. 🌟 核心：直接使用 make_policy，让框架接管底层张量与 EMA 加载
+        actor = make_policy(
+            hydra_cfg=hydra_cfg, 
+            pretrained_policy_name_or_path=str(load_dir)
+        )
+        
+        print("✅ 成功使用 make_policy 加载策略！底层 Normalizer 与平滑权重已自动生效。")
+        
         # 单独注入模型微调需要的超参数
         actor.config.min_sampling_denoising_std = getattr(
             cfg.training, 
@@ -252,8 +271,9 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         actor.forward_dppo = MethodType(forward_dppo, actor) # 将forward_dppo绑定到实例中
         actor.get_logprobs = MethodType(get_logprobs, actor) # 将get_logprobs绑定到实例中
         logging.info("✅ 成功加载 Actor (DiffusionPolicy) 并挂载 DPPO 专用接口！")
+
+        actor.to(device)  # 手动推入 GPU
     except Exception as e:
-        logging.error(f"❌ 权重加载失败！详细报错: {e}")
         raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
     
     # ==========================================
@@ -346,7 +366,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # 初始化 Top-K 快照管理器 (比如最多保留表现最好的 3 个模型)
     max_checkpoints = getattr(cfg.eval, "max_checkpoints", 5)
     records_resume = getattr(cfg.eval, "records_resume", True)
-    checkpoint_metric = getattr(cfg.eval, "loss", True)
+    checkpoint_metric = getattr(cfg.eval, "checkpoint_metric", "loss")
     manager = TopKCheckpointManager(out_dir=out_dir, 
                                     max_keep=max_checkpoints, 
                                     records_resume=records_resume, 
@@ -866,7 +886,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         eval_freq = getattr(cfg.eval, "eval_freq", 5) 
         is_last_step = (itr + 1) == cfg.training.n_train_itr
         
-        if eval_freq > 0 and ((itr + 1) % eval_freq == 0 or is_last_step):
+        if ((itr + 1) >= critic_warmup_iters) and ((itr + 1) % eval_freq == 0 or is_last_step):
             logging.info(f"\n🎬 开始第 {itr+1} 轮的策略评估与录像...")
             
             # 1. 设定本轮视频的保存路径
@@ -895,7 +915,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             ckpt_name = f"{itr+1:06d}_sr={sr:.2f}_reward={ar:.2f}_Ploss={avg_pg_loss:.4f}_Vloss={avg_v_loss:.4f}"
             ckpt_path = Path(out_dir) / "checkpoints" / ckpt_name
             save_path = Path(out_dir) / "checkpoints" / ckpt_name / "pretrained_model"
-            final_videos_dir = Path(out_dir) / "eval" / f"videos_{ckpt_name}"
+            final_videos_dir = Path(ckpt_path) / "eval" / f"eval_videos"
 
             # 执行文件夹重命名 (把 tmp_videos_... 改成 videos_000005_sr=...)
             if tmp_videos_dir.exists() and tmp_videos_dir != final_videos_dir:
@@ -922,10 +942,9 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
 
             
             # 5. 交给 TopKCheckpointManager 进行同步清理
-            # 💡 核心技巧：因为 manager 的逻辑是 loss 越小越保留 (从小到大排序)
-            # 我们想保留 Average Reward 最高的，所以传入负的 reward (-ar) 作为假 loss
-            manager.update(step=itr+1, loss=-ar, ckpt_path=ckpt_path)
-
+            manager.update(step=itr+1, train_loss=avg_v_loss,  ckpt_path=ckpt_path, reward=ar)
+        elif (itr + 1) >= critic_warmup_iters:
+            logging.info(f"critic网络训练预训练中，本轮不进行actor模型的参数更新和评估")
 
 @hydra.main(version_base="1.2", config_name="ft_default", config_path="../configs/finetune")
 def train_cli(cfg: DictConfig):
@@ -937,8 +956,8 @@ def train_cli(cfg: DictConfig):
 if __name__ == "__main__":
     # 命令行参数注入
     default_args = [
-        "policy=ft_static_wrist_diffusion",
-        "training.pretrained_ckpt_path='outputs/pretrain/train/2026-04-23/20-30-23_SewNeedle-2Arms-v0_pre_static_wrist_diffusion/checkpoints/0126000_loss=0.0042'",
+        "policy=ft_zed_wrist_diffusion",
+        "training.pretrained_ckpt_path='outputs/pretrain/train/2026-05-13/23-21-10_SewNeedle-3Arms-v0_pre_zed_wrist_diffusion/checkpoints/174000_loss=0.0018_sr=70.0_ar=545.44'",
         "env.n_envs=2",
         "training.rollout_steps=200", 
         "training.batch_size=4",     

@@ -27,3 +27,5 @@
 <camera name="zed_cam_right" pos="-0.03 0.00119254 -0.04325" euler="1.57079632679 0 3.14159265359" fovy="66.21" mode="fixed"/> 
 ```
 3. 可以在评估eval.py代码中查看推理时间，一把来说一次会推理horizon步，这一次推理时间是最久的，后续只从推理的动作中取出并执行即可，所以推理时间会呈现 类似[31.86 ms、0.26 ms、0.31 ms、0.29 ms...]的分布,长度是实际执行的步数n_action_steps
+
+4. 读取权重进行推理时建议使用policy=make_policy(...)实例化策略，相比于仅能读取裸模型参数的 DiffusionPolicy.from_pretrained()，make_policy 能够完整装载训练期参数（尤其是动作归一化高度依赖的 dataset_stats）。

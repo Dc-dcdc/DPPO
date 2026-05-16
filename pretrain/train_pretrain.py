@@ -528,8 +528,8 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         raise ValueError(f"❌ 严重冲突：模型中未找到相机相关参数。请检查模型输入是否正确。")
     obs_cameras = list(dict.fromkeys(ref_cams + cfg.eval.render_camera))
 
-    # 读取 YAML 中的 name ("sim_envs") 和 task ("SewNeedle-2Arms-v0")
-    # 拼接出 "sim_envs/SewNeedle-2Arms-v0"
+    # 读取 YAML 中的 name ("guided_vision") 和 task ("SewNeedle-2Arms-v0")
+    # 拼接出 "guided_vision/SewNeedle-2Arms-v0"
     env_id = f"{cfg.env.name}/{cfg.env.task}" 
     
     logging.info(f"正在通过 Gym 注册表构建环境: {env_id}")
@@ -616,8 +616,8 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
-        "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
-        "policy=pre_zed_diffusion", # 策略
+        "env=sim_sew_needle_2arms", # 环境，这俩定义在default文件中
+        "policy=pre_wrist_diffusion", # 策略
         "resume=false",
         "resume_path='outputs/pretrain/train/2026-05-08/12-14-28_SewNeedle-3Arms-v0_pre_zed_diffusion/checkpoints/136000_loss=0.0066_sr=30.0_ar=139.05'",
         "training.batch_size=16",

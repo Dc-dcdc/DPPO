@@ -7,7 +7,7 @@ ENVS = {
     # ==========================================
     #  穿针任务 (3臂)
     # ==========================================
-    "sim_envs/SewNeedle-3Arms-v0": {   
+    "guided_vision/SewNeedle-3Arms-v0": {   
         "entry_point": "env.sim_envs:SewNeedleEnv",  # 指向你的文件路径和类名
         "num_arms": 3,
         "episode_length": 300,
@@ -16,7 +16,7 @@ ENVS = {
         "observation_width": 640,
     },
     # 穿针任务 (2臂)
-    "sim_envs/SewNeedle-2Arms-v0": {
+    "guided_vision/SewNeedle-2Arms-v0": {
         "entry_point": "env.sim_envs:SewNeedleEnv",
         "num_arms": 2,
         "episode_length": 300,
@@ -28,7 +28,7 @@ ENVS = {
     # ==========================================
     #  插槽插入任务 (3臂)
     # ==========================================
-    "sim_envs/SlotInsertion-3Arms-v0": {   
+    "guided_vision/SlotInsertion-3Arms-v0": {   
         "entry_point": "env.sim_envs:SlotInsertionEnv",  # 指向你的文件路径和类名
         "num_arms": 3,
         "episode_length": 300,
@@ -37,7 +37,7 @@ ENVS = {
         "observation_width": 640,
     },
     # 💡 如果你有其他的任务（比如插孔），可以继续在这里添加：
-    # "sim_envs/InsertPeg-3Arms-v0": {
+    # "guided_vision/InsertPeg-3Arms-v0": {
     #     "entry_point": "env.sim_envs:InsertPegEnv",
     #     "num_arms": 3,
     #     "cameras": ["zed_cam_left", "zed_cam_right", "overhead_cam"],

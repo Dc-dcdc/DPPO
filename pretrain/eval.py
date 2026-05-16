@@ -336,7 +336,7 @@ def evaluate_and_checkpoint_if_needed(
         # 触发 Top-K 筛选与清理
         if train_loss is not None:
             if ckpt_path.exists():
-                manager.update(step, train_loss, ckpt_path, reward=sr)
+                manager.update(step, train_loss, ckpt_path, reward=ar)
         else:
             logging.warning("⚠️ 警告: 未传入 train_loss，跳过 Top-K 模型清理逻辑，将保留所有权重。")
 
@@ -396,34 +396,27 @@ def main(eval_cfg):
     print(f"💾 正在从目录重建网络并加载权重: {load_dir}")
     try:
         
-        # 1. 寻找 config.yaml (可能在 load_dir 下，也可能在它的父目录)
+        from pathlib import Path
+        from lerobot.common.utils.utils import init_hydra_config
+
+        # 1. 寻找 config.yaml 路径
         config_yaml_path = Path(load_dir) / "config.yaml"
         if not config_yaml_path.exists():
             config_yaml_path = Path(load_dir).parent / "config.yaml"
             
         if not config_yaml_path.exists():
-            raise FileNotFoundError(f"找不到 config.yaml，无法读取策略类型！")
+            raise FileNotFoundError(f"找不到 config.yaml，无法初始化 hydra_cfg！")
 
-        # 2. 读取 YAML 并提取 policy.name
-        with open(config_yaml_path, "r", encoding="utf-8") as f:
-            full_cfg = yaml.safe_load(f)
-            policy_name = full_cfg.get("policy", {}).get("name", "").lower()
-            
-        # 3. 根据 policy_name 明确调用对应的类
-        if policy_name == "act":
-            print("🎯 检测到 ACT 模型，加载 ACTPolicy...")
-            from lerobot.common.policies.act.modeling_act import ACTPolicy
-            policy = ACTPolicy.from_pretrained(load_dir)
-            
-        elif policy_name == "diffusion":
-            print("🎯 检测到 Diffusion 模型，加载 DiffusionPolicy...")
-            # 直接使用 DiffusionPolicy 官方类，绕开所有版本不兼容的 API
-            from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
-            # 像加载常规 Hugging Face 模型一样，直接读取文件夹
-            policy = DiffusionPolicy.from_pretrained(load_dir)
-        else:
-            raise ValueError(f"❌ 未知的策略类型: {policy_name}。目前仅支持 act 或 diffusion。")
+        # 2. 根据 yaml 文件初始化 hydra_cfg 对象
+        hydra_cfg = init_hydra_config(str(config_yaml_path))
+
+        # 3. 🌟 核心：直接使用 make_policy，让框架接管底层张量与 EMA 加载
+        policy = make_policy(
+            hydra_cfg=hydra_cfg, 
+            pretrained_policy_name_or_path=str(load_dir)
+        )
         
+        print("✅ 成功使用 make_policy 加载策略！底层 Normalizer 与平滑权重已自动生效。")
         # 手动推入 GPU
         policy.to(device)
     except Exception as e:
@@ -448,12 +441,12 @@ def main(eval_cfg):
             
             # 安全地从 YAML 的字典树中提取 env.name 和 env.task
             env_cfg = full_cfg.get("env", {})
-            env_name = env_cfg.get("name", getattr(env_cfg, "name", "sim_envs"))
+            env_name = env_cfg.get("name", getattr(env_cfg, "name", "guided_vision"))
             env_task = env_cfg.get("task", getattr(env_cfg, "task", "SewNeedle-3Arms-v0"))
             logging.info(f"📦 成功从预训练文件夹读取完整环境配置: {env_name}/{env_task}")
     else:
         # 极限防呆后备
-        env_name = getattr(eval_cfg, "name", "sim_envs")
+        env_name = getattr(eval_cfg, "name", "guided_vision")
         env_task = getattr(eval_cfg, "task", "SewNeedle-3Arms-v0")
         logging.warning(f"⚠️ 未找到 config.yaml，使用本地设定的后备环境: {env_name}/{env_task}")
 
@@ -528,10 +521,10 @@ if __name__ == "__main__":
     # 🎯 核心配置区：在这里自由修改你的评估参数！
     # ==========================================
     eval_cfg = SimpleNamespace(
+        seed=100,
         # 📂 模型路径设置 (直接指向 0000600_loss=0.1540 文件夹即可，代码会自动寻找内部结构)
-        ckpt_path="outputs/pretrain/train/2026-05-13/12-12-14_SewNeedle-3Arms-v0_pre_zed_diffusion/checkpoints/164000_loss=0.0017_sr=10.0_ar=-2.58",
+        ckpt_path="outputs/pretrain/train/2026-05-15/18-38-40_SewNeedle-2Arms-v0_pre_wrist_diffusion/checkpoints/230000_loss=0.0023_sr=70.0_ar=533.26",
         # ⚙️ 评估参数设置
-        seed=101,
         n_episodes=100,             # 评估多少个任务                 
         max_episodes_rendered=10,  # 保存多少个视频 
         fps=25,                   # 视频帧率，和环境控制频率对齐

@@ -20,11 +20,12 @@ training:
   pretrained_ckpt_path: "outputs/pretrain/train/.../checkpoints/050000"
   min_sampling_denoising_std: 0.01  # 为 DDIM 采样注入的动作探索标准差
   reward_ema_alpha: 0.05 #滑动更新全局奖励方差
-  target_kl: 1
+  target_kl: 1000
   lr_backbone: 1e-5
 
 
 eval:
+  checkpoint_metric: "reward" # 筛选指标：可选 'loss' 或 'reward'
   max_checkpoints: 10  # 最多保存loss最小的几个模型快照
   n_episodes: 10             # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 4   # 最多保存前几个 episode 的录像视频

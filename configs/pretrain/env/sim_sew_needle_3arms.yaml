@@ -9,7 +9,7 @@ eval:
   use_async_envs: false
 
 env:
-  name: sim_envs
+  name: guided_vision
   task: SewNeedle-3Arms-v0
   state_dim: 21
   action_dim: 21

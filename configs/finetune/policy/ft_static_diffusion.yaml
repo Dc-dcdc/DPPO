@@ -5,7 +5,7 @@ seed: 1000
 dataset_repo_id : "dppo_online_rollout"  # lerobot底层的logger需要这个进行分组，不写会报错
 
 env:
-  name : sim_envs
+  name : guided_vision
   task : SewNeedle-2Arms-v0
   n_envs: 1                            # 并行环境数量
 
