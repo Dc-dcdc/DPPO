@@ -1,30 +1,48 @@
-from huggingface_hub import HfApi
+import os
+from huggingface_hub import HfApi, login
+
+# 1. 绝对不要使用 hf-mirror 镜像！确保删除镜像环境变量
+if "HF_ENDPOINT" in os.environ:
+    del os.environ["HF_ENDPOINT"]
+
+# 2. 挂上刚才测试成功的本地代理
+# (如果你刚才测试时改了端口，请务必在这里也改成你刚才测试成功的端口！)
+os.environ["http_proxy"] = "http://127.0.0.1:7897"
+os.environ["https_proxy"] = "http://127.0.0.1:7897"
+
+# 3. 填入你刚才测试成功的 Token
+MY_HF_TOKEN = "XXXXXXXXXXXXXXXXXXXXX"
 
 def push_model_folder_to_hf(local_dir, repo_id, commit_message="Upload model"):
-    api = HfApi()
+    # 强制在代码层面登录
+    login(token=MY_HF_TOKEN)
+    
+    # 明确绑定 Token 初始化 API
+    api = HfApi(token=MY_HF_TOKEN)
     
     print(f"📦 准备将本地文件夹: {local_dir} 上传至 Hugging Face Hub...")
     print(f"🎯 目标仓库: https://huggingface.co/{repo_id}")
     
-    # 1. 确保仓库存在，如果不存在则自动创建 (repo_type="model" 表示这是模型仓库)
-    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
+    # 1. 创建仓库 (如果已存在则跳过)
+    api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)                                                                                                                                       
     
-    # 2. 上传整个文件夹
+    # 2. 上传文件夹
+    print("🚀 正在拼命上传中，这可能需要一点时间，请耐心等待...")
     api.upload_folder(
-        folder_path=local_dir,
-        repo_id=repo_id,
+        folder_path=local_dir, # 本地的文件夹路径
+        repo_id=repo_id,       # 目标仓库 ID
         repo_type="model",
+        path_in_repo="pretrained_model",  # 在仓库中新建的子文件夹
         commit_message=commit_message,
-        # ignore_patterns=["*.log", "eval_videos/"] # 如果有不想上传的临时文件可以忽略
     )
     
     print("✅ 模型上传成功！")
 
 if __name__ == "__main__":
-    # 替换为你实际的本地模型文件夹路径
-    LOCAL_MODEL_DIR = "outputs/pretrain/train/2026-05-13/23-21-10_SewNeedle-3Arms-v0_pre_zed_wrist_diffusion/checkpoints/174000_loss=0.0018_sr=70.0_ar=545.44/pretrained_model"
+    # 你的本地模型文件夹路径，末尾一定要有pretrained_model
+    LOCAL_MODEL_DIR = "outputs/pretrain/train/2026-05-18/21-39-48_SewNeedle-3Arms-v0_pre_zed_wrist_act/checkpoints/032000_loss=0.0729_sr=0.0_ar=-113.35/pretrained_model"
     
-    # 替换为你的 Hugging Face 用户名和你想取的仓库名
-    HF_REPO_ID = "Dc-dc/pre_zed_wrist_diffusion" # 例如: "iantc104/sew-needle-3arms-diffusion"
+    # 你的目标仓库
+    HF_REPO_ID = "Dc-dc/pre_sim_sew_needle_3arms_zed_wrist_act"
     
     push_model_folder_to_hf(LOCAL_MODEL_DIR, HF_REPO_ID)

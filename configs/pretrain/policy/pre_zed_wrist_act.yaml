@@ -69,7 +69,7 @@ policy:
     observation.images.wrist_cam_right: mean_std
     observation.state: mean_std
   output_normalization_modes:
-    action: mean_std
+    action: min_max
 
   # Architecture.
   # Vision backbone.

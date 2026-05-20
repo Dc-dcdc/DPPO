@@ -5,7 +5,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from dm_control import mjcf
 import mujoco.viewer
-
+from lerobot.common.envs.utils import preprocess_observation
 
 from env.constants import (
     XML_DIR,
@@ -60,33 +60,36 @@ class GuidedVisionEnv(gym.Env):
         # ==========================================
         """
         {
-            "observation.images.cam_1": Box(...),
-            "observation.images.cam_2": Box(...),
-            "observation.state": Box(...)
+        "pixels": {
+            "cam_1": Box(...),
+            "cam_2": Box(...)
+        },
+        "agent_pos": Box(...)
         }
         """
-        obs_spaces = {}
-        # 动态遍历并注册所有的相机图像空间
-        for cam_name in self.cameras:
-            # 这里的键名严格对齐 LeRobot 的规范：observation.images.xxxx
-            obs_spaces[f'observation.images.{cam_name}'] = spaces.Box(
-                low=0, high=255, shape=(3, self.observation_height, self.observation_width), dtype=np.uint8
-            )
-            
-        # 注册 21维本体状态
-        obs_spaces['observation.state'] = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.num_joints,), dtype=np.float64
-        ) 
-        
-        self.observation_space = spaces.Dict(obs_spaces)
-        
-        # ==========================================
-        # 🌟 3. 定义动作空间 (Action Space): 21维关节目标角度
-        # ==========================================
-        self.action_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.num_joints,), dtype=np.float64
-        )   
-        
+        self.observation_space = spaces.Dict(
+            {
+                "pixels": spaces.Dict(
+                    {
+                        camera : spaces.Box(
+                            low=0,
+                            high=255,
+                            shape=(self.observation_height, self.observation_width, 3),
+                            dtype=np.uint8,
+                        ) 
+                        for camera in self.cameras
+                    }
+                ),
+                "agent_pos": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(self.num_joints,),
+                    dtype=np.float64,
+                ),
+            }
+        )
+        self.action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_joints,), dtype=np.float32) 
+
         # ==========================================
         # 🌟 4. 寻址与绑定 MJCF 节点，和底层的 MuJoCo XML 物理模型之间建立连接
         # ==========================================
@@ -137,22 +140,33 @@ class GuidedVisionEnv(gym.Env):
             agent_pos = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float64) 
         # state_21d = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float32)
 
+        return {
+            'pixels': {
+                camera: self._physics.render(
+                    height=self.observation_height, 
+                    width=self.observation_width, 
+                    camera_id=camera
+                )
+                for camera in self.cameras
+            },
+            'agent_pos': agent_pos,
+        }
         # ==========================================
         # 🌟 2. 渲染相机图像并转换通道为 (C, H, W)
         # ==========================================
         # 2. 准备返回的字典
-        obs_dict = {'observation.state': agent_pos}
-        for cam_name in self.cameras:
-            # 注意：这里的 camera_id 必须和你的 XML 文件里 <camera name="..."> 的名字完全一致！
-            try:
-                img = self._physics.render(height=self.observation_height, width=self.observation_width, camera_id=cam_name)
-                img = np.transpose(img, (2, 0, 1))# 转换通道 (H, W, C) -> (C, H, W)
-                # 存入字典，键名严格对齐
-                obs_dict[f'observation.images.{cam_name}'] = img
-            except Exception as e:
-                raise ValueError(f"❌ 渲染相机 '{cam_name}' 失败！请检查 XML 文件中是否有这个名字的相机。报错详情: {e}")
+        # obs_dict = {'observation.state': agent_pos}
+        # for cam_name in self.cameras:
+        #     # 注意：这里的 camera_id 必须和你的 XML 文件里 <camera name="..."> 的名字完全一致！
+        #     try:
+        #         img = self._physics.render(height=self.observation_height, width=self.observation_width, camera_id=cam_name)
+        #         img = np.transpose(img, (2, 0, 1))# 转换通道 (H, W, C) -> (C, H, W)
+        #         # 存入字典，键名严格对齐
+        #         obs_dict[f'observation.images.{cam_name}'] = img
+        #     except Exception as e:
+        #         raise ValueError(f"❌ 渲染相机 '{cam_name}' 失败！请检查 XML 文件中是否有这个名字的相机。报错详情: {e}")
 
-        return obs_dict
+        # return obs_dict
 
     def reset(self, seed=None, options=None) -> tuple:
         super().reset(seed=seed)
@@ -213,8 +227,6 @@ class GuidedVisionEnv(gym.Env):
         reward = self.get_reward() if hasattr(self, 'get_reward') else 0.0
         
         # 6. 判断终止条件
-        # max_rwd = getattr(self, 'max_reward', -1)
-        # terminated = bool(reward >= max_rwd - 1e-4) # 达到最大奖励则任务成功结束
         truncated = bool(self._current_step >= self.episode_length) # 超出最大步数
         
         info = {"is_success": self.terminated, "reward": reward, "step": self._current_step}
@@ -438,6 +450,7 @@ class SewNeedleEnv(GuidedVisionEnv):
                 # 掉落惩罚，但因为有之前的一次性奖励撑腰，它依然敢于尝试交接
                 # reward -= 0.5
                 # 重新提供一个引导左臂去抓针的低保底引力，逼迫它捏紧双指
+                
                 reward += 3.0 * np.exp(-15.0 * dist_left_to_mark)
                 
             else:
@@ -698,18 +711,17 @@ if __name__ == '__main__':
         # 正常策略执行
         # ------------------------------------
         if global_cmd["run_policy"]:
-            batch = {}
-            for k in policy.config.input_shapes.keys():
-                if k in obs:
-                    v_safe = obs[k].copy()
-                    if "images" in k:
-                        tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device) / 255.0
-                    else:
-                        tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device)
-                    batch[k] = tensor_v
+            # [h w c] -> [b c h w] ,并/ 255.0
+            obs = preprocess_observation(obs)
+            # 键值过滤与设备转移：只保留模型配置中真正需要的输入特征，推入 GPU
+            obs = {
+                k: v.to(device, non_blocking=True)
+                for k, v in obs.items()
+                if k in policy.config.input_shapes  # 🌟 保留这层保护，防止多余状态引发报错
+            }
 
             with torch.no_grad():
-                action_tensor = policy.select_action(batch) 
+                action_tensor = policy.select_action(obs) 
             action = action_tensor.squeeze(0).cpu().numpy()
 
             try:

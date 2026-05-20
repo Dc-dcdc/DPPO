@@ -4,6 +4,7 @@ import torchvision.models as models
 import torchvision.transforms as T
 import numpy as np
 
+# 从新开始训练resnet参数
 class ImageCritic(nn.Module):
     def __init__(self, camera_names, state_dim=21, hidden_dim=256):
         super().__init__()
@@ -86,3 +87,35 @@ class ImageCritic(nn.Module):
         value = self.mlp(concat_features) # [BS, 1]
         
         return value.squeeze(-1) # 返回 [BS]
+    
+# 和actor共享视觉底座
+class SharedFeatureCritic(nn.Module):
+    def __init__(self, global_cond_dim):
+        """
+        纯净版共享 Critic：没有卷积，没有状态编码器。
+        参数 global_cond_dim: Actor 吐出的全局特征向量维度
+        """
+        super().__init__()
+        
+        # 核心 MLP 评价网络 (由于输入已经是高维融合特征，直接上 512)
+        self.mlp = nn.Sequential(
+            nn.Linear(global_cond_dim, 512),
+            nn.LayerNorm(512), 
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+        self._apply_orthogonal_init()
+
+    def _apply_orthogonal_init(self):
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.constant_(m.bias, 0.0)
+        nn.init.orthogonal_(self.mlp[-1].weight, gain=0.01)
+
+    def forward(self, global_cond):
+        """期望输入: Actor 提取好的带有梯度树的特征向量 [BS, global_cond_dim]"""
+        value = self.mlp(global_cond) # [BS, 1]
+        return value.squeeze(-1)      # [BS]

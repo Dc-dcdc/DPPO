@@ -330,7 +330,6 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         actor.get_logprobs = MethodType(get_logprobs, actor) # 将get_logprobs绑定到实例中
         logging.info("✅ 成功加载 Actor (DiffusionPolicy) 并挂载 DPPO 专用接口！")
 
-        actor.to(device)  # 手动推入 GPU
     except Exception as e:
         raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
     
@@ -417,6 +416,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         
     logging.info(f"🧠 动态探测到 Actor 视觉底座输出特征维度为: {global_cond_dim}")
 
+    actor.to(device)  # 在所有 Gym 子进程全部 Spawn 安全启动后再 手动推入 GPU
     critic = SharedFeatureCritic(global_cond_dim=global_cond_dim).to(device)
     logging.info("✅ 成功初始化 Shared Critic (完美视觉底座共享模式)！")
 
@@ -483,6 +483,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # 🌟 主循环：DPPO 强化学习全流程
     # ==========================================
     n_obs_steps = getattr(actor.config, "n_obs_steps", 2)
+    use_disk_cache = getattr(cfg.training, "use_disk_cache", False)
     for itr in range(cfg.training.n_train_itr):
         logging.info(f"\n========== 第 {itr+1}/{cfg.training.n_train_itr} 轮迭代 ==========")
         
@@ -498,13 +499,27 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         raw_obs_queue = {k: deque(maxlen=n_obs_steps) for k in prev_obs.keys()}
         obs_trajs = None
 
-        # 保存去噪链 (Chains) 用于计算 Logprob
-        chains_trajs = np.zeros(
+        if use_disk_cache:
+            # 使用硬盘缓存
+            temp_buffer_dir = tempfile.TemporaryDirectory()
+            buffer_path = temp_buffer_dir.name
+            logging.info(f"💾 [缓存模式] 已开启硬盘缓存 (Memmap)，临时目录: {buffer_path}")
+            
+            chains_trajs = np.memmap(
+                os.path.join(buffer_path, 'chains_trajs.npy'), 
+                dtype=np.float32, 
+                mode='w+',
+                shape=(n_steps, n_envs, denoising_steps + 1, horizon_steps, action_dim)
+            )         # (步数，环境数，去噪步数，预测步数，动作维度)
+        else:
+            temp_buffer_dir = None
+            logging.info("💾 [缓存模式] 使用纯内存 (RAM) 收集数据，追求极致速度...")
             # (步数，环境数，去噪步数，预测步数，动作维度)
-            (n_steps, n_envs, denoising_steps + 1, horizon_steps, action_dim),
-            dtype=np.float32
-        )
-        
+            chains_trajs = np.zeros(
+                (n_steps, n_envs, denoising_steps + 1, horizon_steps, action_dim),
+                dtype=np.float32
+            )
+
         reward_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
         terminated_trajs = np.zeros((n_steps, n_envs), dtype=np.float32)
         completed_ep_rewards = []                                # 存放所有【已经跑完】的回合的总分
@@ -541,10 +556,18 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             
             # 使用包含了完整 T 维度的 stacked_raw_obs 初始化 obs_trajs
             if obs_trajs is None:
-                obs_trajs = {
-                    k: np.zeros((n_steps, *v.shape), dtype=v.dtype)
-                    for k, v in stacked_raw_obs.items()
-                }
+                obs_trajs = {}
+                for k, v in stacked_raw_obs.items():
+                    if use_disk_cache:
+                        safe_k = k.replace(".", "_")
+                        obs_trajs[k] = np.memmap(
+                            os.path.join(buffer_path, f'obs_{safe_k}.npy'),
+                            dtype=v.dtype,
+                            mode='w+',
+                            shape=(n_steps, *v.shape)
+                        )
+                    else:
+                        obs_trajs[k] = np.zeros((n_steps, *v.shape), dtype=v.dtype)
 
             # 1. 格式化当前单帧观测给 Actor 去推断 ，forward_dppo中会补成2帧进行推理
             batch_obs = {}
@@ -659,12 +682,13 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         # =========================================================
         logging.info("🧠 计算状态价值 (Values) 与优势函数 (GAE)...")
         
-        # 1. 将收集到的字典张量展平，形状由 [n_steps, n_envs, T, H, W, C] 变为 [n_steps*n_envs, T, H, W, C] ，相当于是n_steps*n_envs个样本
-        # 为防止显存爆掉，先不加 .to(device)，让它留在 CPU 内存中！
-        obs_k_cpu = {
-            k: einops.rearrange(torch.from_numpy(v), "s e ... -> (s e) ...")
-            for k, v in obs_trajs.items()
-        }
+        # 利用 reshape 虚拟展平 (不管底层是 RAM 还是 Disk，均不触发全量内存加载)
+        # 将 Chains 展平为 [(步数*环境数), 去噪步数, 预测视野, 动作维度]
+        chains_flat = chains_trajs.reshape(n_steps * n_envs, denoising_steps + 1, horizon_steps, action_dim)
+        
+        obs_flat = {}
+        for k, v in obs_trajs.items():
+            obs_flat[k] = v.reshape(n_steps * n_envs, *v.shape[2:])
         
         with torch.no_grad():
             # 分批次 (Mini-batch) 计算 Critic 价值，防止显存爆炸
@@ -677,8 +701,8 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 
                 # 临时切下一小块推入 GPU
                 obs_chunk = {}
-                for k, v in obs_k_cpu.items():
-                    tensor_v = v[i:end_i].float().to(device)
+                for k, v in obs_flat.items():
+                    tensor_v = torch.from_numpy(v[i:end_i]).float().to(device)
                     if "images" in k:
                         # [B, T, H, W, C] -> [B, T, C, H, W]
                         tensor_v = tensor_v.permute(0, 1, 4, 2, 3) / 255.0
@@ -814,11 +838,6 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         adv_upper = torch.quantile(advantages_k, 0.95)
         advantages_k = torch.clamp(advantages_k, min=adv_lower, max=adv_upper)
 
-        # 将 Chains 展平为 [(步数*环境数), 去噪步数, 预测视野, 动作维度]
-        chains_k = einops.rearrange(
-            torch.from_numpy(chains_trajs).float().to(device),
-            "s e t h d -> (s e) t h d"
-        )
         # total_steps 表示包含去噪步数的总状态转移次数 (例如：300 * 5 * 10)
         total_steps = n_steps * n_envs * denoising_steps  
 
@@ -839,21 +858,26 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             for i in range(0, total_steps, eval_batch_size):
                 inds = torch.arange(i, min(i + eval_batch_size, total_steps), device=device)
                 b_inds, d_inds = torch.unravel_index(inds, (n_steps * n_envs, denoising_steps))
-                
-                # 从 CPU 取出这一小批的画面放入 GPU
+                # ===================================================
+                # 🌟 懒加载兼容修改 1：将 GPU 索引转为 CPU Numpy 索引，才能切片 memmap
+                # ===================================================
+                b_inds_np = b_inds.cpu().numpy()
+                d_inds_np = d_inds.cpu().numpy()
+
+                # 从硬盘/内存按需拉取画面到 GPU
                 obs_eval = {}
-                for k, v in obs_k_cpu.items():
-                    tensor_v = v[b_inds.cpu()].float().to(device)
+                for k, v in obs_flat.items():
+                    tensor_v = torch.from_numpy(v[b_inds_np]).float().to(device)
                     if "images" in k:
                         # [Batch, Time, H, W, C] -> [Batch, Time, C, H, W]
                         tensor_v = tensor_v.permute(0, 1, 4, 2, 3)/ 255.0
-
                     obs_eval[k] = tensor_v
-
+                chains_prev_eval = torch.from_numpy(chains_flat[b_inds_np, d_inds_np]).float().to(device)
+                chains_next_eval = torch.from_numpy(chains_flat[b_inds_np, d_inds_np + 1]).float().to(device)
                 logprobs = actor.get_logprobs(
                     cond=obs_eval, 
-                    x_t=chains_k[b_inds, d_inds], 
-                    x_t_1=chains_k[b_inds, d_inds + 1], 
+                    x_t=chains_prev_eval, 
+                    x_t_1=chains_next_eval, 
                     timesteps=recorded_timesteps[d_inds],
                     return_global_cond=False
                 )
@@ -883,11 +907,17 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                     (n_steps * n_envs, denoising_steps) #n_steps * n_envs行，denoising_steps列
                 )
                 
+                # ===================================================
+                # 将 GPU 上的批量索引转为 CPU Numpy 格式
+                # ===================================================
+                b_inds_np = batch_inds_b.cpu().numpy()
+                d_inds_np = denoising_inds_b.cpu().numpy()
+                
                 # 切片提取 Mini-batch
                 obs_b = {}           # 给 Actor （带历史帧）
                 
-                for k, v in obs_k_cpu.items():
-                    tensor_v = v[batch_inds_b.cpu()].float().to(device)
+                for k, v in obs_flat.items():
+                    tensor_v = torch.from_numpy(v[b_inds_np]).float().to(device)
                     if "images" in k:
                         # [Batch, Time, H, W, C] -> [Batch, Time, C, H, W]
                         tensor_v = tensor_v.permute(0, 1, 4, 2, 3)/ 255.0
@@ -895,15 +925,19 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                     # 完整数据给 Actor
                     obs_b[k] = tensor_v
                 
-                # obs_b = {k: v[batch_inds_b] for k, v in obs_k.items()}        # 取出对应样本的观测，也就是对应环境和步数的观测
-                chains_prev_b = chains_k[batch_inds_b, denoising_inds_b]      # 对应样本的当前去噪步 动作
-                chains_next_b = chains_k[batch_inds_b, denoising_inds_b + 1]  # 对应样本的下一个去噪步 动作
+
+
+                # ===================================================
+                # 从硬盘 (或系统内存) 按需拉取这一小批动作切片到 GPU
+                # ===================================================
+                chains_prev_b = torch.from_numpy(chains_flat[b_inds_np, d_inds_np]).float().to(device)      
+                chains_next_b = torch.from_numpy(chains_flat[b_inds_np, d_inds_np + 1]).float().to(device)
                 returns_b = returns_k[batch_inds_b]                           # 对应样本的总回报
                 advantages_b = advantages_k[batch_inds_b]                     # 每一轮去噪步公用一个优势值
                 timesteps_b = recorded_timesteps[denoising_inds_b]
                 
                 # ==========================================
-                # 🌟 官方对齐 5：去噪步骤的优势衰减折扣
+                # 去噪步骤的优势衰减折扣
                 # 越接近输出端 (denoising_inds_b 越大)，折扣越接近 1.0
                 # ==========================================
                 gamma_denoising = getattr(cfg.training, "gamma_denoising", 0.99)
@@ -1001,7 +1035,10 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         # 🌟 修复 4：PPO 阶段结束，清扫全部巨大的训练经验张量，让显存归还给评估和下一次 Rollout
         # =========================================================
         try:
-            del chains_k, returns_k, advantages_k, values_k, old_logprobs_k, obs_k_cpu
+            del chains_flat, returns_k, advantages_k, values_k, old_logprobs_k, obs_flat
+            # 如果开启了硬盘缓存，必须显式调用 cleanup() 删除物理文件
+            if use_disk_cache and temp_buffer_dir is not None:
+                temp_buffer_dir.cleanup()
         except Exception:
             pass
         torch.cuda.empty_cache()
@@ -1036,7 +1073,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         eval_freq = getattr(cfg.eval, "eval_freq", 5) 
         is_last_step = (itr + 1) == cfg.training.n_train_itr
         
-        if ((itr + 1) >= critic_warmup_iters) and ((itr + 1) % eval_freq == 0 or is_last_step):
+        if ((itr + 1) > critic_warmup_iters) and ((itr + 1) % eval_freq == 0 or is_last_step):
             logging.info(f"\n🎬 开始第 {itr+1} 轮的策略评估与录像...")
             
             # 1. 设定本轮视频的保存路径
@@ -1110,9 +1147,8 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             
             # 5. 交给 TopKCheckpointManager 进行同步清理
             manager.update(step=itr+1, loss=avg_pg_loss,  ckpt_path=ckpt_path, reward=ar)
-        elif (itr + 1) >= critic_warmup_iters:
-            logging.info(f"critic网络训练预训练中，本轮不进行actor模型的参数更新和评估")
-
+        elif (itr + 1) <= critic_warmup_iters:
+            logging.info(f"Critic 正在预热阶段 ({itr+1}/{critic_warmup_iters})，本轮暂不评估 Actor 模型")
 @hydra.main(version_base="1.2", config_name="ft_default", config_path="../configs/finetune")
 def train_cli(cfg: DictConfig):
     train_dppo_finetune(
@@ -1126,7 +1162,7 @@ if __name__ == "__main__":
         "policy=ft_zed_wrist_diffusion",
         "training.pretrained_ckpt_path='outputs/1.hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion'",
         "env.n_envs=10",
-        "training.rollout_steps=40", 
+        "training.rollout_steps=200", 
         "training.batch_size=8",     
         "training.update_epochs=2",     
         "wandb.enable=false",

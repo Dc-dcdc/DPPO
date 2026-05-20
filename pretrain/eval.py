@@ -24,6 +24,7 @@ import sys
 from types import SimpleNamespace
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.utils.utils import get_safe_torch_device
+from lerobot.common.envs.utils import preprocess_observation
 import env.sim_envs
 # 确保能够导入你的环境
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -168,20 +169,26 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
                 frames.append(env.unwrapped.render(render_camera)) # gym创建需要加上 .unwrapped
                 # frames.append(env.render(render_camera))  #直接创建环境不需要
 
-            # 2. 手动处理格式，将 Numpy 字典转为 Tensor 字典送入模型
-            batch = {}
-            # 🌟 修复：只提取模型 config 中真正需要的输入特征！
-            for k in policy.config.input_shapes.keys():
-                if k in obs:
-                    v_safe = obs[k].copy()
-                    if "images" in k:
-                        # 图片：[C, H, W] -> [1, C, H, W] -> 归一化
-                        tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device) / 255.0
-                    else:
-                        # 状态：[21] -> [1, 21]
-                        tensor_v = torch.from_numpy(v_safe).float().unsqueeze(0).to(device)
-                    batch[k] = tensor_v
+            def prepare_obs(obj):
+                """递归字典，拷贝连续内存，并强行在最前面增加一个 Batch 维度"""
+                if isinstance(obj, dict):
+                    return {k: prepare_obs(v) for k, v in obj.items()}
+                elif hasattr(obj, "copy"):  # 如果是 numpy 数组
+                    return np.expand_dims(obj.copy(), axis=0).copy() # [H, W, C] -> [1, H, W, C]
+                return obj
             
+            # 在送入官方预处理之前，强制清洗内存并扩维
+            obs = prepare_obs(obs)
+
+            # [b, H, W, C] -> [b, C, H, W] ,并/ 255.0
+            obs = preprocess_observation(obs)
+
+            # 2. 键值过滤与设备转移：只保留模型配置中真正需要的输入特征，推入 GPU
+            obs = {
+                k: v.to(device)
+                for k, v in obs.items()
+                if k in policy.config.input_shapes  # 🌟 保留这层保护，防止多余状态引发报错
+            }
             # ==========================================
             # ⏱️ 开始计时：使用高精度的 perf_counter
             # ==========================================
@@ -190,7 +197,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
             # 3. 推理获取动作
             with torch.no_grad():
                 # 使用lerobot自带的推理函数
-                action = policy.select_action(batch) # 这里每次取出一个动作，推理依旧一次生成8个动作，只是一个个往外取
+                action = policy.select_action(obs) # 这里每次取出一个动作，推理依旧一次生成8个动作，只是一个个往外取
             # 4. 把模型输出的 Tensor 动作转回 Numpy (包含在计时内)
             action_np = action.squeeze(0).cpu().numpy()
 
@@ -523,7 +530,7 @@ if __name__ == "__main__":
     eval_cfg = SimpleNamespace(
         seed=100,
         # 📂 模型路径设置 (直接指向 0000600_loss=0.1540 文件夹即可，代码会自动寻找内部结构)
-        ckpt_path="outputs/pretrain/train/2026-05-15/18-38-40_SewNeedle-2Arms-v0_pre_wrist_diffusion/checkpoints/230000_loss=0.0023_sr=70.0_ar=533.26",
+        ckpt_path="outputs/finetune/train/2026-05-20/11-39-22_SewNeedle-3Arms-v0_ft_zed_wrist_diffusion/checkpoints/000002_sr=0.60_reward=424.36_Ploss=0.1290_Vloss=4.1540",
         # ⚙️ 评估参数设置
         n_episodes=100,             # 评估多少个任务                 
         max_episodes_rendered=10,  # 保存多少个视频 

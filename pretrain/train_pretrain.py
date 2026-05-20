@@ -7,8 +7,6 @@ from env.sim_envs import SewNeedleEnv
 import logging
 import time
 import sys
-import json    # 用于保存 Top-K 的历史记录文件
-import shutil  # 用于删除多余的模型文件夹
 from contextlib import nullcontext
 from pathlib import Path
 from pprint import pformat
@@ -374,7 +372,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     logging.info(f"⏱️ 解析到的动作时间轴: {resolved_delta_timestamps.get('action', [])[:5]} ...")
     logging.info(f"⏱️ 解析到的视觉时间轴: {resolved_delta_timestamps.get('observation.state', [])}")
 
-    
+
     offline_dataset = LeRobotDataset(
         repo_id=cfg.dataset_repo_id, #根据id下载或者加载本地数据（/home/dc/.cache/huggingface/datasets）
         delta_timestamps=resolved_delta_timestamps,
@@ -537,6 +535,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # 使用 gym.make 创建环境，并通过 kwargs 强行覆盖你需要的相机
     eval_env = gym.make(
         id=env_id, 
+        disable_env_checker=True,  
         cameras=obs_cameras,  # 👈 这里的传参会直接覆盖 __init__.py 里的默认套餐！
     )
     logging.info(f"✅ 环境加载成功！最终挂载的相机: {obs_cameras}")
@@ -616,10 +615,10 @@ if __name__ == "__main__":
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
     # 这里面也可以随时添加你想覆盖的 args 参数
     default_args = [
-        "env=sim_sew_needle_2arms", # 环境，这俩定义在default文件中
-        "policy=pre_wrist_diffusion", # 策略
-        "resume=false",
-        "resume_path='outputs/pretrain/train/2026-05-08/12-14-28_SewNeedle-3Arms-v0_pre_zed_diffusion/checkpoints/136000_loss=0.0066_sr=30.0_ar=139.05'",
+        "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
+        "policy=pre_zed_static_wrist_diffusion", # 策略
+        "resume=True",
+        "resume_path='outputs/pretrain/train/2026-05-19/00-57-05_SewNeedle-3Arms-v0_pre_zed_static_wrist_diffusion/checkpoints/108000_loss=0.0111_sr=0.0_ar=-64.33'",
         "training.batch_size=16",
         "training.num_workers=4",
         "wandb.enable=false", # 关闭 wandb，不需要aLse" ,
