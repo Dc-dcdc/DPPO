@@ -196,7 +196,7 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
 
             # 3. 推理获取动作
             with torch.no_grad():
-                # 使用lerobot自带的推理函数
+                # 使用lerobot自带的推理函数，obs是单帧的，模型会自动处理历史动作的拼接和缓存
                 action = policy.select_action(obs) # 这里每次取出一个动作，推理依旧一次生成8个动作，只是一个个往外取
             # 4. 把模型输出的 Tensor 动作转回 Numpy (包含在计时内)
             action_np = action.squeeze(0).cpu().numpy()
@@ -426,6 +426,8 @@ def main(eval_cfg):
         print("✅ 成功使用 make_policy 加载策略！底层 Normalizer 与平滑权重已自动生效。")
         # 手动推入 GPU
         policy.to(device)
+        print("cuda available:", torch.cuda.is_available())
+        print("policy device:", next(policy.parameters()).device)
     except Exception as e:
         raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
     
@@ -530,7 +532,7 @@ if __name__ == "__main__":
     eval_cfg = SimpleNamespace(
         seed=100,
         # 📂 模型路径设置 (直接指向 0000600_loss=0.1540 文件夹即可，代码会自动寻找内部结构)
-        ckpt_path="outputs/finetune/train/2026-05-20/11-39-22_SewNeedle-3Arms-v0_ft_zed_wrist_diffusion/checkpoints/000002_sr=0.60_reward=424.36_Ploss=0.1290_Vloss=4.1540",
+        ckpt_path="outputs/finetune/train/2026-05-28/21-46-43_SewNeedle-3Arms-v0_ft_zed_wrist_diffusion/checkpoints/000024_sr=0.70_reward=421.10_Ploss=0.0292_Vloss=0.4864",
         # ⚙️ 评估参数设置
         n_episodes=100,             # 评估多少个任务                 
         max_episodes_rendered=10,  # 保存多少个视频 
@@ -539,10 +541,10 @@ if __name__ == "__main__":
         
         # 📷 相机设置
         # ['zed_cam_left', 'zed_cam_right', 'overhead_cam', 'worms_eye_cam' , 'wrist_cam_left', 'wrist_cam_right'],
-        render_camera=['overhead_cam'],         # 保存video的相机视角    
+        render_camera=['worms_eye_cam'],         # 保存video的相机视角    
         # ⚡ 混合精度设置 (推荐在评估时设为 False 以保证确定性)
         use_amp=False,          
     )
-    # ==========================================
+    # ==========================================print("cuda available:", torch.cuda.is_available())
     # 启动
     main(eval_cfg=eval_cfg)

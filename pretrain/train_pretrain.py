@@ -617,7 +617,7 @@ if __name__ == "__main__":
     default_args = [
         "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
         "policy=pre_zed_static_wrist_diffusion", # 策略
-        "resume=True",
+        "resume=false",
         "resume_path='outputs/pretrain/train/2026-05-19/00-57-05_SewNeedle-3Arms-v0_pre_zed_static_wrist_diffusion/checkpoints/108000_loss=0.0111_sr=0.0_ar=-64.33'",
         "training.batch_size=16",
         "training.num_workers=4",

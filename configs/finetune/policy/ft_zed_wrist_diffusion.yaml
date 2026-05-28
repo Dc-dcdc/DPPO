@@ -7,35 +7,39 @@ dataset_repo_id : "dppo_online_rollout"  # lerobot底层的logger需要这个进
 env:
   name : guided_vision
   task : SewNeedle-3Arms-v0
-  n_envs: 1                            # 并行环境数量   
+  n_envs: 5                            # 并行环境数量
 
 training:
   # 预训练权重的绝对路径 (用来初始化 Actor)
   pretrained_ckpt_path: none
-  n_critic_warmup_itr: 1   # Critic 网络的预训练步数
+  n_critic_warmup_itr: 5   # Critic 网络的预训练步数
   # RL 训练步数与频率
-  n_train_itr: 10000          # 总迭代轮数，微调通常不需要跑太久
-  rollout_steps: 100          # 每次收集多少步数据再去更新
-  batch_size: 50              # PPO 更新的 batch size
-  update_epochs: 5            # 收集完数据后，在这些数据上更新几轮网络  
+  n_train_itr: 1000           # 总迭代轮数，微调通常不需要跑太久
+  rollout_steps: 80           # 每个环境收集多少个action chunk；5环境时总样本量约等于旧单环境400 chunk
+  batch_size: 16              # PPO 更新的 batch size
+  update_epochs: 1            # 收集完数据后，在这些数据上更新几轮网络
 
   # 学习率 (微调时一定要极小，防止破坏预训练特征！)
-  actor_lr: 5e-6               # Diffusion 网络的学习率
-  critic_lr: 1e-4              # Critic 网络的学习率 (通常比 Actor 大)
-  
+  actor_lr: 1e-6               # Diffusion 网络的学习率
+  critic_lr: 3e-4              # Critic 网络的学习率 (通常比 Actor 大)
+
   # PPO 特有参数
   gamma: 0.99                  # 奖励折扣因子
   gae_lambda: 0.95             # GAE 优势计算参数
-  clip_ratio: 0.01             # PPO 截断范围
+  clip_ratio: 0.05             # PPO 截断范围
 
-  gamma_denoising: 0.99        #每个动作的去噪步获得的优势值是一样的，但是这里加上了一个折扣因子，距离最终动作越远的优势值越小
+  gamma_denoising: 0.8        #每个动作的去噪步获得的优势值是一样的，但是这里加上了一个折扣因子，距离最终动作越远的优势值越小
   weight_decay: 1e-6
+  min_sampling_denoising_std: 0.02
+  min_logprob_denoising_std: 0.02
+  target_kl: 0.02
+  bc_loss_coef: 0.005
 
 eval:
-  eval_freq: 1               # 评估频率
+  eval_freq: 2               # 评估频率
   render_camera: ['overhead_cam']  # 评估时保存的video视角相机
 
 policy:
   name: diffusion
   n_action_steps: 8           # 执行的实际步数
-  ft_denoising_steps : 10     # ddim去噪步数和ddpm实际记录的去噪步数（即记录最后的几条）
+  ft_denoising_steps : 10      # 只微调最后几步去噪链，视觉任务更稳

@@ -23,7 +23,7 @@ class GuidedVisionEnv(gym.Env):
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 1/SIM_DT}
 
-    def __init__(self, 
+    def __init__(self,
             xml_path: str,
             num_arms: int = 3,
             episode_length: int = 300,
@@ -41,11 +41,11 @@ class GuidedVisionEnv(gym.Env):
         self.cameras = cameras # 使用的摄像头列表
         self.num_arms = num_arms
         self._mjcf_root = mjcf.from_path(xml_path)
-        self._physics = mjcf.Physics.from_mjcf_model(self._mjcf_root)  
+        self._physics = mjcf.Physics.from_mjcf_model(self._mjcf_root)
         self.observation_height = observation_height
-        self.observation_width = observation_width   
-        self._mjcf_root.option.timestep = SIM_PHYSICS_DT  
-        
+        self.observation_width = observation_width
+        self._mjcf_root.option.timestep = SIM_PHYSICS_DT
+
         self.episode_length = episode_length
         self._middle_base_link = self._mjcf_root.find('body', MIDDLE_BASE_LINK)
         self._middle_base_link_init_pos = self._middle_base_link.pos.copy()
@@ -76,7 +76,7 @@ class GuidedVisionEnv(gym.Env):
                             high=255,
                             shape=(self.observation_height, self.observation_width, 3),
                             dtype=np.uint8,
-                        ) 
+                        )
                         for camera in self.cameras
                     }
                 ),
@@ -88,7 +88,7 @@ class GuidedVisionEnv(gym.Env):
                 ),
             }
         )
-        self.action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_joints,), dtype=np.float32) 
+        self.action_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_joints,), dtype=np.float32)
 
         # ==========================================
         # 🌟 4. 寻址与绑定 MJCF 节点，和底层的 MuJoCo XML 物理模型之间建立连接
@@ -110,7 +110,7 @@ class GuidedVisionEnv(gym.Env):
         # 🌟 5. 夹爪归一化函数
         # ==========================================
         # 读取真实物理引擎中夹爪电机的控制限位
-        self.left_gripper_range = self._physics.bind(self._left_actuators[-1]).ctrlrange 
+        self.left_gripper_range = self._physics.bind(self._left_actuators[-1]).ctrlrange
         self.right_gripper_range = self._physics.bind(self._right_actuators[-1]).ctrlrange
         # 归一化：(x - min) / (max - min)
         self.left_gripper_norm_fn = lambda x: (x - self.left_gripper_range[0]) / (self.left_gripper_range[1] - self.left_gripper_range[0])
@@ -119,32 +119,32 @@ class GuidedVisionEnv(gym.Env):
         self.left_gripper_unnorm_fn = lambda x: x * (self.left_gripper_range[1] - self.left_gripper_range[0]) + self.left_gripper_range[0]
         self.right_gripper_unnorm_fn = lambda x: x * (self.right_gripper_range[1] - self.right_gripper_range[0]) + self.right_gripper_range[0]
 
-        self._viewer = None 
+        self._viewer = None
 
     def get_obs(self) -> dict:
         """获取并格式化模型输入所需的字典"""
         # ==========================================
         # 🌟 1. 提取本体感知状态 (Proprioceptive State)
         # ==========================================
-        left_qpos = self._physics.bind(self._left_joints).qpos.copy() 
+        left_qpos = self._physics.bind(self._left_joints).qpos.copy()
         left_qpos[6] = self.left_gripper_norm_fn(left_qpos[6]) # 夹爪数据归一化
-        
+
         right_qpos = self._physics.bind(self._right_joints).qpos.copy()
         right_qpos[6] = self.right_gripper_norm_fn(right_qpos[6])
-        
+
         middle_qpos = self._physics.bind(self._middle_joints).qpos.copy()
-        
+
         if self.num_arms == 2:
             agent_pos = np.concatenate([left_qpos, right_qpos]).astype(np.float64)
         elif self.num_arms == 3:
-            agent_pos = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float64) 
+            agent_pos = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float64)
         # state_21d = np.concatenate([left_qpos, right_qpos, middle_qpos]).astype(np.float32)
 
         return {
             'pixels': {
                 camera: self._physics.render(
-                    height=self.observation_height, 
-                    width=self.observation_width, 
+                    height=self.observation_height,
+                    width=self.observation_width,
                     camera_id=camera
                 )
                 for camera in self.cameras
@@ -174,24 +174,25 @@ class GuidedVisionEnv(gym.Env):
         # 🌟 新增：重置回合内部的步数计数器
         self._current_step = 0
         # 恢复默认位姿
-        self._physics.bind(self._left_joints).qpos = LEFT_ARM_POSE 
+        self._physics.bind(self._left_joints).qpos = LEFT_ARM_POSE
         self._physics.bind(self._left_gripper_joints).qpos = self.left_gripper_unnorm_fn(1) # 夹爪张开到最大
         self._physics.bind(self._right_joints).qpos = RIGHT_ARM_POSE
         self._physics.bind(self._right_gripper_joints).qpos = self.right_gripper_unnorm_fn(1)
         self._physics.bind(self._middle_joints).qpos = MIDDLE_ARM_POSE
         # 初始化控制器
-        self._physics.bind(self._left_actuators).ctrl = LEFT_ARM_POSE 
-        self._physics.bind(self._left_actuators[6]).ctrl = self.left_gripper_unnorm_fn(1) 
+        self._physics.bind(self._left_actuators).ctrl = LEFT_ARM_POSE
+        self._physics.bind(self._left_actuators[6]).ctrl = self.left_gripper_unnorm_fn(1)
         self._physics.bind(self._right_actuators).ctrl = RIGHT_ARM_POSE
         self._physics.bind(self._right_actuators[6]).ctrl = self.right_gripper_unnorm_fn(1)
         self._physics.bind(self._middle_actuators).ctrl = MIDDLE_ARM_POSE
         # 强制物理引擎进行一次正向运动学计算
-        self._physics.forward() 
+        self._physics.forward()
         self.terminated = False
+        self.is_success = False
         # 读取当前环境的观测
         observation = self.get_obs()
         info = {"message": "Environment reset successfully."}
-        return observation, info   
+        return observation, info
 
     def step(self, action: np.ndarray) -> tuple:
         """Gymnasium 标准步进函数"""
@@ -199,7 +200,7 @@ class GuidedVisionEnv(gym.Env):
         if np.isnan(action).any() or np.isinf(action).any():
             print("⚠️ 警告：检测到非法动作 (NaN/Inf)，已启动安全降级为全 0 动作！")
             action = np.zeros_like(action)
-        
+
         # 2. 动作拆包
         left_joints = action[:6]
         # left_gripper = action[6]
@@ -225,11 +226,15 @@ class GuidedVisionEnv(gym.Env):
         # 5. 获取观察与奖励
         observation = self.get_obs()
         reward = self.get_reward() if hasattr(self, 'get_reward') else 0.0
-        
+
         # 6. 判断终止条件
         truncated = bool(self._current_step >= self.episode_length) # 超出最大步数
-        
-        info = {"is_success": self.terminated, "reward": reward, "step": self._current_step}
+
+        info = {
+            "is_success": bool(getattr(self, "is_success", False)),
+            "reward": reward,
+            "step": self._current_step,
+        }
 
         return observation, float(reward),  self.terminated, truncated, info
 
@@ -242,7 +247,7 @@ class GuidedVisionEnv(gym.Env):
         # 这里默认使用 self.cameras 列表里的第一个相机
         # render_cam = self.cameras[0] if len(self.cameras) > 0 else 'zed_cam_left'
         render_cam = render_camera[0] if len(render_camera) > 0 else 'overhead_cam'
-        
+
         try:
             # MuJoCo 的 render 默认输出的就是标准的 (H, W, C) rgb_array
             img = self._physics.render(height=self.observation_height, width=self.observation_width, camera_id=render_cam)
@@ -251,7 +256,7 @@ class GuidedVisionEnv(gym.Env):
             # 防止万一没找到相机导致崩溃
             print(f"⚠️ 渲染视频帧失败: {e}")
             return np.zeros((self.observation_height, self.observation_width, 3), dtype=np.uint8)
-        
+
     def render_viewer(self):
         if self._viewer is None:
             self._viewer = mujoco.viewer.launch_passive(
@@ -281,15 +286,69 @@ class SewNeedleEnv(GuidedVisionEnv):
         self._needle_joint = self._mjcf_root.find('joint', 'needle_joint')
         self._wall_joint = self._mjcf_root.find('joint', 'wall_joint')
         self._threaded_needle = False
+        self._prev_dists = {} #  用于存储上一步的距离字典
 
-    def reset(self, seed=None, options=None) -> tuple:     
+    def _calculate_distances(self):
+        """🌟 辅助函数：统一计算所有关键点的坐标与距离"""
+        # 1. 提取物体坐标
+        needle_head = self._physics.named.data.geom_xpos['needle_head']                #针头
+        needle_tail = self._physics.named.data.geom_xpos['needle_tail']                #针尾
+        needle_left_pos = self._physics.named.data.geom_xpos['needle_mark_1_4']        #左臂抓取标记点 1/4处
+        needle_right_pos = self._physics.named.data.geom_xpos['needle_mark_3_4']       #右臂抓取标记点 3/4处
+
+        left_left_finger = self._physics.named.data.geom_xpos['left_left_g2']
+        left_right_finger = self._physics.named.data.geom_xpos['left_right_g2']
+        right_left_finger = self._physics.named.data.geom_xpos['right_left_g2']        #右臂左指尖
+        right_right_finger = self._physics.named.data.geom_xpos['right_right_g2']      #右臂右指尖
+
+        hole_entrance = self._physics.named.data.geom_xpos['hole_entrance']            #出洞口
+        hole_exit = self._physics.named.data.geom_xpos['hole_exit']                    #出洞口
+
+        # 2. 计算复合中心点
+        left_gripper_center = (left_left_finger + left_right_finger) / 2.0
+        right_gripper_center = (right_left_finger + right_right_finger) / 2.0
+        needle_center = (needle_head + needle_tail) / 2.0
+        wall_center_x = (hole_entrance[0] + hole_exit[0]) / 2.0
+
+        # 3. 终极抬举误差解耦计算
+        target_z_target = hole_exit[2] + 0.12
+        z_error = max(0.0, target_z_target - needle_center[2])
+        x_error = abs(needle_center[0] - wall_center_x)
+        y_error = abs(needle_center[1] - hole_exit[1])
+        composite_error_dist = np.sqrt(x_error**2 + y_error**2 + z_error**2)
+
+        # 4. 返回所有距离信息
+        return {
+            'head_pos': needle_head.copy(),
+            'tail_pos': needle_tail.copy(),
+            'entrance_pos': hole_entrance.copy(),
+            'exit_pos': hole_exit.copy(),
+            'needle_z': needle_center[2],
+            'hole_z': hole_exit[2],
+
+            # 强化学习需要计算差分的绝对距离
+            'dist_right_to_mark': np.linalg.norm(right_gripper_center - needle_right_pos),
+            'dist_head_to_entrance': np.linalg.norm(needle_head - hole_entrance),
+            'dist_head_to_exit': np.linalg.norm(needle_head - hole_exit),
+            'dist_left_to_mark': np.linalg.norm(left_gripper_center - needle_left_pos),
+            'dist_tail_to_exit': np.linalg.norm(needle_tail - hole_exit),
+            'composite_error_dist': composite_error_dist,
+
+            # 保存误差用于通关判定
+            'x_error': x_error,
+            'y_error': y_error,
+            'z_error': z_error
+        }
+
+    def reset(self, seed=None, options=None) -> tuple:
         super().reset(seed=seed)
+        rng = self.np_random
         # 随机化针的位置
         x_range = [0.15, 0.2]
         y_range = [-.025, 0.1]
         z_range = [0.0, 0.0]
         ranges = np.vstack([x_range, y_range, z_range])
-        needle_position = np.random.uniform(ranges[:, 0], ranges[:, 1])
+        needle_position = rng.uniform(ranges[:, 0], ranges[:, 1])
         needle_quat = np.array([1, 0, 0, 0])
 
         # 随机化墙(洞)的位置
@@ -297,39 +356,38 @@ class SewNeedleEnv(GuidedVisionEnv):
         y_range = [-.025, 0.1]
         z_range = [0.0, 0.0]
         ranges = np.vstack([x_range, y_range, z_range])
-        wall_position = np.random.uniform(ranges[:, 0], ranges[:, 1])
-        wall_quat = np.array([1, 0, 0, 0]) 
+        wall_position = rng.uniform(ranges[:, 0], ranges[:, 1])
+        wall_quat = np.array([1, 0, 0, 0])
 
         self._physics.bind(self._needle_joint).qpos = np.concatenate([needle_position, needle_quat])
         self._physics.bind(self._wall_joint).qpos = np.concatenate([wall_position, wall_quat])
 
         self._physics.forward()
         self._threaded_needle = False
-        self.needle_reached_exit = False  # 针头穿墙标志位
-        self.left_has_grasped = False     # 左臂成功接针标志位
-        self.needle_completely_through = False # 针完全过孔标志位
-        self.needle_start_through = False # 针开始过孔标志位        
+        self.needle_reached_exit = False                 # 针头穿墙标志位
+        self.left_has_grasped = False                    # 左臂成功接针标志位
+        self.needle_completely_through = False           # 针完全过孔标志位
+        self.needle_start_through = False                # 针开始过孔标志位
+        self._prev_dists = self._calculate_distances()   # 记录物理引擎第一帧的距离，作为差分计算的起点
         observation = self.get_obs()
         info = {"message": "SewNeedle env reset."}
         return observation, info
-    
-    def get_reward(self):
 
+    def get_reward(self):
         touch_left_gripper = False
         touch_right_gripper = False
-        # 存放当前帧里所有碰到针的物体名字
-        objects_touching_needle = set()
+        objects_touching_needle = set()     # 存放当前帧里所有碰到针的物体名字
 
         # 遍历底层物理引擎计算出的所有有效接触点 (Contacts)
         for i_contact in range(self._physics.data.ncon):
             # 提取发生碰撞的两个物体的底层 ID
             id_geom_1 = self._physics.data.contact[i_contact].geom1
             id_geom_2 = self._physics.data.contact[i_contact].geom2
-            
+
             # 将底层 ID 翻译成你在 XML 环境文件中定义的名字 (如 "peg", "right_finger_1")
             geom1 = self._physics.model.id2name(id_geom_1, 'geom')
             geom2 = self._physics.model.id2name(id_geom_2, 'geom')
-            
+
             # 只有两个物体都有名字时，才加入判定列表(双向记录)
             if geom1 and geom2:
                 # 2. 只要有一方是针，就把另一方的名字扔进篮子
@@ -343,7 +401,6 @@ class SewNeedleEnv(GuidedVisionEnv):
         touched_left_right = any(obj.startswith("left_right") for obj in objects_touching_needle)
         if touched_left_left and touched_left_right:
             touch_left_gripper = True
-            
         # 检查右夹爪是否成功捏住
         touched_right_left = any(obj.startswith("right_left") for obj in objects_touching_needle)
         touched_right_right = any(obj.startswith("right_right") for obj in objects_touching_needle)
@@ -351,147 +408,109 @@ class SewNeedleEnv(GuidedVisionEnv):
             touch_right_gripper = True
 
         # ==========================================
-        # 提取相关坐标
+        # 🌟 提取当前帧的距离字典
         # ==========================================
-        needle_head = self._physics.named.data.geom_xpos['needle_head']                #针头
-        needle_tail = self._physics.named.data.geom_xpos['needle_tail']                #针尾
-        needle_left_pos = self._physics.named.data.geom_xpos['needle_mark_1_4']        #左臂抓取标记点 1/4处
-        needle_right_pos = self._physics.named.data.geom_xpos['needle_mark_3_4']       #右臂抓取标记点 3/4处
-        
-        left_left_finger = self._physics.named.data.geom_xpos['left_left_g2']
-        left_right_finger = self._physics.named.data.geom_xpos['left_right_g2']        
-        right_left_finger = self._physics.named.data.geom_xpos['right_left_g2']        #右臂左指尖
-        right_right_finger = self._physics.named.data.geom_xpos['right_right_g2']      #右臂右指尖
-
-        hole_entrance = self._physics.named.data.geom_xpos['hole_entrance']            #出洞口
-        hole_exit = self._physics.named.data.geom_xpos['hole_exit']                    #出洞口
+        curr_dists = self._calculate_distances()
 
         # ==========================================
-        # 计算左右臂和针距离奖励
+        # 阶段流转奖励逻辑 (稀疏事件奖励保留)
         # ==========================================
-        # 计算右臂夹爪的中心点 (Pinch Center)
-        left_gripper_center = (left_left_finger + left_right_finger) / 2.0
-        right_gripper_center = (right_left_finger + right_right_finger) / 2.0
+        reward = -1.0 # 存活的时间惩罚，逼迫其快速完成任务
 
-        # 计算右臂夹爪中心到针标记点的距离
-        dist_left_to_mark = np.linalg.norm(left_gripper_center - needle_left_pos)
-        dist_right_to_mark = np.linalg.norm(right_gripper_center - needle_right_pos)
-        
-        # ==========================================
-        # 计算针穿过墙洞的奖励
-        # ==========================================
-        # 计算针头到入口的距离
-        dist_head_to_entrance = np.linalg.norm(needle_head - hole_entrance)
-
-        # 计算针头到“洞口出口(hole_exit)”的距离
-        dist_head_to_exit = np.linalg.norm(needle_head - hole_exit)
-        
-        # 计算针尾到出口的距离
-        dist_tail_to_exit = np.linalg.norm(needle_tail - hole_exit)
-
-        # ==========================================
-        # 阶段流转奖励逻辑
-        # ==========================================
-        # 每走一步扣 0.5 分，降低步数
-        reward = -1
-
-        # 触发 1：针头到达入口 (进洞),给个很小的值防止在外面就判断进去了 ，加上3d距离防止绕墙
-        if needle_head[0] - hole_entrance[0] < 0.001 and dist_head_to_entrance < 0.01:
-            if not self.needle_start_through: # 确保只触发一次
+        # 触发 1：针头到达入口 (进洞)
+        if curr_dists['head_pos'][0] - curr_dists['entrance_pos'][0] < 0.001 and curr_dists['dist_head_to_entrance'] < 0.01:
+            if not self.needle_start_through:     # 确保只触发一次
                 self.needle_start_through = True
-                reward += 25.0  # 突破瞬间的巨额奖励
+                reward += 25.0
 
         # 触发 2：针头到达出口 (露头)
-        if needle_head[0] < hole_exit[0] and dist_head_to_exit < 0.02:
+        if curr_dists['head_pos'][0] < curr_dists['exit_pos'][0] and curr_dists['dist_head_to_exit'] < 0.02:
             if not self.needle_reached_exit:
                 self.needle_reached_exit = True
-                reward += 50.0  # 突破瞬间的巨额奖励
+                reward += 50.0
 
         # 触发 3：左手成功接应
         if self.needle_reached_exit and touch_left_gripper:
             if not self.left_has_grasped:
                 self.left_has_grasped = True
-                reward += 75.0  # 突破瞬间的巨额奖励
-        
+                reward += 75.0
+
         # 触发 4：针尾完全拔出
-        # # 穿孔方向为沿着 X 轴向负方向移动，针尾小于出口 且 距离小于设定值（防止从墙外面绕过）
-        if needle_tail[0] < hole_exit[0] and dist_tail_to_exit < 0.02:
+        # 穿孔方向为沿着 X 轴向负方向移动，针尾小于出口 且 距离小于设定值（防止从墙外面绕过）
+        if curr_dists['tail_pos'][0] < curr_dists['exit_pos'][0] and curr_dists['dist_tail_to_exit'] < 0.02:
             if not self.needle_completely_through:
                 self.needle_completely_through = True
-                reward += 100.0  # 突破瞬间的巨额奖励
-        
+                reward += 100.0
+
+        # ==========================================
+        # 🌟 差分连续奖励 (Dense Differential Rewards)
+        # ==========================================
+        # 差分倍率：例如设为 150，意味着机器人每靠近目标 1 厘米(0.01m)，就能获得 +1.5 分。
+        # 如果原地不动，差分为 0，就会实打实地吃满 -1 的时间惩罚！
+        diff_scale = 150.0
+
         if not self.left_has_grasped:
             # --- 前半场：右臂主导 ---
-
-            if not touch_right_gripper:  # 右臂未抓针
-                # 引导右臂接近 针3/4 处的奖励
-                reward += 2.0 * np.exp(-15.0 * dist_right_to_mark)
-            else: 
+            if not touch_right_gripper:
+                # 引导右臂接近针
+                progress = self._prev_dists['dist_right_to_mark'] - curr_dists['dist_right_to_mark']
+                reward += diff_scale * progress
+            else:
                 reward += 0.25 # 保持抓取的微弱奖励
                 if not self.needle_start_through:
-                    # 没到达洞口，引导针头到达入口 （最高5分）
-                    reward += 5 * np.exp(-15.0 * dist_head_to_entrance)
+                    # 没到达洞口，引导针头到达入口
+                    progress = self._prev_dists['dist_head_to_entrance'] - curr_dists['dist_head_to_entrance']
+                    reward += diff_scale * progress
                 elif not self.needle_reached_exit:
                     # 到达洞口，引导针头到达出口
-                    reward += 5 * np.exp(-20.0 * dist_head_to_exit)
+                    progress = self._prev_dists['dist_head_to_exit'] - curr_dists['dist_head_to_exit']
+                    reward += diff_scale * progress
                 else:
-                    # 到达出口，引导左臂接近针标记
-                    reward += 3 * np.exp(-15.0 * dist_left_to_mark)
+                    # 引导左臂接近露出的针头
+                    progress = self._prev_dists['dist_left_to_mark'] - curr_dists['dist_left_to_mark']
+                    reward += diff_scale * progress
 
-        else: 
+        else:
             # --- 后半场：左臂主导 ---
-            reward += 0.25 
-            # 惩罚右手，逼迫其松开并让开空间
+            reward += 0.25
             if touch_right_gripper:
-                reward -= 0.5 
+                reward -= 0.5 # 惩罚右手不松开
 
             if not touch_left_gripper:
-                # 左手只是碰了一下但没抓稳，或者中途脱手了
-                # 掉落惩罚，但因为有之前的一次性奖励撑腰，它依然敢于尝试交接
-                # reward -= 0.5
-                # 重新提供一个引导左臂去抓针的低保底引力，逼迫它捏紧双指
-                
-                reward += 3.0 * np.exp(-15.0 * dist_left_to_mark)
-                
-            else:
-                reward += 0.25 # 保持抓紧的微弱奖励
-                # 3. 终极判定：针尾是否完全越过出口
-
-                if not self.needle_completely_through:
-                    # 左手往外拔出
-                    # 连续奖励：引导左臂继续往外拉，直到针尾到达出口
-                    reward += 5.0 * np.exp(-15.0 * dist_tail_to_exit)
+                #  如果左手脱靶导致针掉落（跌落到洞口下方 3 厘米以上）
+                if curr_dists['needle_z'] < (curr_dists['hole_z'] - 0.03):
+                    reward -= 100.0
+                    self.is_success = False
+                    self.terminated = True # 判负，任务彻底失败，重新开局
                 else:
-                    # print("✅ 针尾完全越过出口！")
-                    # 针已完全拔出，执行抬举动作验证
-                    wall_center_x = (hole_entrance[0] + hole_exit[0]) / 2.0
-                    target_z_target = hole_exit[2] + 0.12 # 最低要求抬起 12 厘米，总高度17cm
-                    
-                    # 2. 计算针的中心点
-                    needle_center = (needle_head + needle_tail) / 2.0
-                    
-                    # 3. 独立计算各轴误差 (解耦 Z 轴)
-                    # Z轴误差：巧妙使用 max()，只要当前高度超过 target_z_min，误差就归零！举多高都不会受罚。
-                    z_error = max(0.0, target_z_target - needle_center[2])
-                    x_error = abs(needle_center[0] - wall_center_x)
-                    y_error = abs(needle_center[1] - hole_exit[1])
-                    
-                    # 将解耦后的误差重新合成为复合距离，专供连续奖励计算使用
-                    composite_error_dist = np.sqrt(x_error**2 + y_error**2 + z_error**2)
-                    
-                    # 4. 独立且宽容的成功判定条件
-                    # 只要高度超过下限 (z_error == 0)，且 XY 平面没有偏离墙体中心太远 (比如 2 厘米内容差)
-                    is_above_wall = (z_error == 0.0) and (x_error < 0.01) #and (y_error < 0.02)
-                    
+                    # 还在半空中，引导左臂快速抓回
+                    progress = self._prev_dists['dist_left_to_mark'] - curr_dists['dist_left_to_mark']
+                    reward += diff_scale * progress
+            else:
+                reward += 0.25
+                if not self.needle_completely_through:
+                    # 引导左臂往外拉
+                    progress = self._prev_dists['dist_tail_to_exit'] - curr_dists['dist_tail_to_exit']
+                    reward += diff_scale * progress
+                else:
+                    #  确保安全停稳在墙正上方
+                    is_above_wall = (curr_dists['z_error'] == 0.0) and (curr_dists['x_error'] < 0.015) #and (curr_dists['y_error'] < 0.05)
+
                     if not is_above_wall:
-                        # 连续奖励：此时距离变量变成了 composite_error_dist
-                        reward += 10.0 * np.exp(-15.0 * composite_error_dist)
+                        # 引导向上抬举并对中
+                        progress = self._prev_dists['composite_error_dist'] - curr_dists['composite_error_dist']
+                        reward += diff_scale * progress
                     else:
-                        # 阶段 6：终极胜利！针被成功拔出、抬高，并稳稳处于墙的正上方
-                        reward += 500.0 
+                        reward += 500.0
+                        self.is_success = True
                         self.terminated = True
 
+        # ==========================================
+        # 🌟 更新历史距离状态，为下一帧做准备
+        # ==========================================
+        self._prev_dists = curr_dists
         return float(reward)
+
 
 
 class SlotInsertionEnv(GuidedVisionEnv):
@@ -506,25 +525,26 @@ class SlotInsertionEnv(GuidedVisionEnv):
 
     def reset(self, seed=None, options=None) -> tuple:
         super().reset(seed=seed, options=options)
+        rng = self.np_random
 
         # reset physics
         x_range = [-0.05, 0.05]
         y_range = [0.1, 0.15]
         z_range = [0.0, 0.0]
         ranges = np.vstack([x_range, y_range, z_range])
-        slot_position = np.random.uniform(ranges[:, 0], ranges[:, 1])
+        slot_position = rng.uniform(ranges[:, 0], ranges[:, 1])
         slot_quat = np.array([1, 0, 0, 0])
 
 
-        peg_position = np.random.uniform(ranges[:, 0], ranges[:, 1])
+        peg_position = rng.uniform(ranges[:, 0], ranges[:, 1])
         peg_quat = np.array([1, 0, 0, 0])
 
         x_range = [-0.08, 0.08]
         y_range = [-0.1, 0.0]
         z_range = [0.0, 0.0]
         ranges = np.vstack([x_range, y_range, z_range])
-        stick_position = np.random.uniform(ranges[:, 0], ranges[:, 1])
-        stick_quat = np.array([1, 0, 0, 0]) 
+        stick_position = rng.uniform(ranges[:, 0], ranges[:, 1])
+        stick_quat = np.array([1, 0, 0, 0])
 
         self._physics.bind(self._slot_joint).qpos = np.concatenate([slot_position, slot_quat])
         self._physics.bind(self._stick_joint).qpos = np.concatenate([stick_position, stick_quat])
@@ -535,7 +555,7 @@ class SlotInsertionEnv(GuidedVisionEnv):
         info = {"is_success": False}
 
         return observation, info
-    
+
 
     def get_reward(self):
 
@@ -558,7 +578,7 @@ class SlotInsertionEnv(GuidedVisionEnv):
         for geom1, geom2 in contact_pairs:
             if geom1 == "stick" and geom2.startswith("right"):
                 touch_right_gripper = True
-            
+
             if geom1 == "stick" and geom2.startswith("left"):
                 touch_left_gripper = True
 
@@ -599,39 +619,42 @@ if __name__ == '__main__':
     import time
     from pathlib import Path
     import mujoco.viewer
-    import cv2       
+    import cv2
     import numpy as np
 
     # ==========================================
     # 🎯 1. 设置权重路径与加载
     # ==========================================
-    ckpt_path = "outputs/pretrain/train/2026-05-13/23-21-10_SewNeedle-3Arms-v0_pre_zed_wrist_diffusion/checkpoints/110000_loss=0.0040_sr=90.0_ar=700.61"
-    
+    ckpt_path = "outputs/1.hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion/pretrained_model"
+
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"⚠️ 找不到权重路径: {ckpt_path}\n请修改为正确的 ckpt_path。")
 
     hf_model_dir = os.path.join(ckpt_path, "pretrained_model")
     load_dir = hf_model_dir if os.path.exists(hf_model_dir) else ckpt_path
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"🚀 初始化推理程序... 使用设备: {device}")
 
     config_yaml_path = Path(load_dir) / "config.yaml"
     if not config_yaml_path.exists():
         config_yaml_path = Path(load_dir).parent / "config.yaml"
-        
+    if not config_yaml_path.exists():
+        raise FileNotFoundError(f"⚠️ 找不到模型配置文件 config.yaml: {config_yaml_path}")
+
     with open(config_yaml_path, "r", encoding="utf-8") as f:
         full_cfg = yaml.safe_load(f)
-        policy_name = full_cfg.get("policy", {}).get("name", "").lower()
 
-    if policy_name == "act":
-        print("🎯 加载 ACT 模型...")
-        from lerobot.common.policies.act.modeling_act import ACTPolicy
-        policy = ACTPolicy.from_pretrained(load_dir)
-    elif policy_name == "diffusion":
-        print("🎯 加载 Diffusion 模型...")
-        from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
-        policy = DiffusionPolicy.from_pretrained(load_dir)
+    print(f"💾 正在从目录重建网络并加载权重: {load_dir}")
+    from lerobot.common.policies.factory import make_policy
+    from lerobot.common.utils.utils import init_hydra_config
+
+    hydra_cfg = init_hydra_config(str(config_yaml_path))
+    policy = make_policy(
+        hydra_cfg=hydra_cfg,
+        pretrained_policy_name_or_path=str(load_dir),
+    )
+    print("✅ 成功使用 make_policy 加载策略！底层 Normalizer 与平滑权重已自动生效。")
 
     policy.to(device)
     policy.eval()
@@ -640,12 +663,34 @@ if __name__ == '__main__':
     # 🎯 2. 初始化环境与相机配置
     # ==========================================
     all_obs_keys = policy.config.input_shapes.keys()
-    obs_cameras = [k.replace("observation.images.", "") for k in all_obs_keys if "observation.images." in k]
-    
-    print("🚀 初始化 SewNeedle 环境...")
-    env = SewNeedleEnv(cameras=obs_cameras)
+    ref_cams = [k.replace("observation.images.", "") for k in all_obs_keys if "observation.images." in k]
+    if not ref_cams:
+        raise ValueError("❌ 模型配置中未找到 observation.images.* 输入，请检查 checkpoint/config.yaml。")
+    obs_cameras = list(dict.fromkeys(ref_cams))
+
+    env_cfg = full_cfg.get("env", {})
+    env_name = env_cfg.get("name", "guided_vision")
+    env_task = env_cfg.get("task", "SewNeedle-3Arms-v0")
+    env_id = f"{env_name}/{env_task}"
+
+    print(f"🚀 正在通过 Gym 注册表初始化环境: {env_id}")
+    print(f"📷 模型观测相机: {obs_cameras}")
+    env = gym.make(
+        id=env_id,
+        disable_env_checker=True,
+        cameras=obs_cameras,
+    )
+    sim_env = env.unwrapped # 获取底层环境以访问物理引擎渲染接口
     obs, info = env.reset()
     policy.reset()
+
+    def prepare_obs(obj):
+        """Align single-env observations with LeRobot's batched preprocessing format."""
+        if isinstance(obj, dict):
+            return {k: prepare_obs(v) for k, v in obj.items()}
+        if hasattr(obj, "copy"):
+            return np.expand_dims(obj.copy(), axis=0).copy()
+        return obj
 
     # 🌟 新增：配置需要额外拼接渲染显示的相机列表
     # 选项参考 CAMERAS 列表: ['zed_cam_left', 'zed_cam_right', 'wrist_cam_left', 'wrist_cam_right', 'overhead_cam', 'worms_eye_cam']
@@ -669,9 +714,9 @@ if __name__ == '__main__':
                 global_cmd["run_policy"] = True
 
     viewer = mujoco.viewer.launch_passive(
-        env._physics.model.ptr, 
-        env._physics.data.ptr,
-        show_left_ui=True, 
+        sim_env._physics.model.ptr,
+        sim_env._physics.data.ptr,
+        show_left_ui=True,
         show_right_ui=True,
         key_callback=key_callback
     )
@@ -701,18 +746,18 @@ if __name__ == '__main__':
         if global_cmd["force_reset"]:
             print(f"⏹️ [键盘指令] 强制重置！当前进度: 步数 {steps}, 奖励 {episode_reward:.2f}")
             obs, info = env.reset()
-            policy.reset()  
+            policy.reset()
             episode_reward = 0.0
             steps = 0
             global_cmd["force_reset"] = False
-            global_cmd["run_policy"] = False  
+            global_cmd["run_policy"] = False
 
         # ------------------------------------
         # 正常策略执行
         # ------------------------------------
         if global_cmd["run_policy"]:
             # [h w c] -> [b c h w] ,并/ 255.0
-            obs = preprocess_observation(obs)
+            obs = preprocess_observation(prepare_obs(obs))
             # 键值过滤与设备转移：只保留模型配置中真正需要的输入特征，推入 GPU
             obs = {
                 k: v.to(device, non_blocking=True)
@@ -721,7 +766,7 @@ if __name__ == '__main__':
             }
 
             with torch.no_grad():
-                action_tensor = policy.select_action(obs) 
+                action_tensor = policy.select_action(obs)
             action = action_tensor.squeeze(0).cpu().numpy()
 
             try:
@@ -730,16 +775,16 @@ if __name__ == '__main__':
                 steps += 1
             except Exception as e:
                 print(f"💥 物理引擎异常中断: {e}")
-                terminated = True 
+                terminated = True
 
             if terminated or truncated:
                 reason = "成功" if terminated else "超时/失败"
                 print(f"🔄 回合自然结束 ({reason})！总步数: {steps}, 累计奖励: {episode_reward:.2f}")
                 obs, info = env.reset()
-                policy.reset() 
+                policy.reset()
                 episode_reward = 0.0
                 steps = 0
-                global_cmd["run_policy"] = False  
+                global_cmd["run_policy"] = False
 
         # ------------------------------------
         # 🌟 实时渲染并拼接多个相机画面
@@ -748,9 +793,9 @@ if __name__ == '__main__':
             frames_bgr = []
             for cam_name in display_cameras:
                 # 渲染单个相机
-                img_rgb = env._physics.render(height=480, width=640, camera_id=cam_name)
+                img_rgb = sim_env._physics.render(height=480, width=640, camera_id=cam_name)
                 img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-                
+
                 # 在画面左上角写上该相机的名字，用于区分
                 cv2.putText(img_bgr, cam_name, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
                 frames_bgr.append(img_bgr)
@@ -759,16 +804,16 @@ if __name__ == '__main__':
             if frames_bgr:
                 max_cols = 2  # 👈 在这里设置一行最多放几个画面
                 grid_rows = []
-                
+
                 # 按照 max_cols 将画面分组
                 for i in range(0, len(frames_bgr), max_cols):
                     row_frames = frames_bgr[i:i + max_cols]
-                    
+
                     # 补齐逻辑：如果最后一行画面数量不足 max_cols，用黑屏画面占位，防止拼接报错
                     while len(row_frames) < max_cols:
                         blank_img = np.zeros_like(frames_bgr[0])
                         row_frames.append(blank_img)
-                        
+
                     # 水平拼接这一行的图像
                     grid_rows.append(np.hstack(row_frames))
 
@@ -776,7 +821,7 @@ if __name__ == '__main__':
                 combined_img = np.vstack(grid_rows)
                 h, w = combined_img.shape[:2]
                 # 叠加全局进度信息 (左下角)
-                cv2.putText(combined_img, f"Step: {steps} | Reward: {episode_reward:.2f}", (20, h - 30), 
+                cv2.putText(combined_img, f"Step: {steps} | Reward: {episode_reward:.2f}", (20, h - 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
                 # 如果未运行策略，在整个拼接画面的中央叠加暂停大字提示
                 if not global_cmd["run_policy"]:
@@ -784,12 +829,12 @@ if __name__ == '__main__':
                     text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
                     text_x = (w - text_size[0]) // 2
                     text_y = (h + text_size[1]) // 2
-                    cv2.putText(combined_img, text, (text_x, text_y), 
+                    cv2.putText(combined_img, text, (text_x, text_y),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
 
                 # 显示最终拼接好的图像
                 cv2.imshow(window_name, combined_img)
-            
+
             # 监听 OpenCV 窗口按键
             cv_key = cv2.waitKey(1) & 0xFF
             if cv_key == ord(' '):  # 空格键

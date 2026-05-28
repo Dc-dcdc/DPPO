@@ -58,11 +58,12 @@ def forward_dppo(self, cond: dict, return_chain=True):
         batch["observation.images"] = torch.stack([batch[k] for k in self.expected_image_keys], dim=-4)
         
     # 重点：把当前帧塞进历史队列 (Queue) 中
-    self._queues = populate_queues(self._queues, batch)
+    # self._queues = populate_queues(self._queues, batch)
     
     # 从队列中提取包含了 n_obs_steps 帧的历史数据
-    stacked_batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
+    # stacked_batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
     
+    stacked_batch = batch
     # 获取动态的 batch_size (即并行的 n_envs 个数) 和设备
     batch_size = next(iter(stacked_batch.values())).shape[0]
     device = get_device_from_parameters(self)
@@ -98,31 +99,6 @@ def forward_dppo(self, cond: dict, return_chain=True):
         
     chains = []
     
-    # ==========================================
-    # 5. 手动展开去噪循环 (Denoising Loop)
-    # ==========================================
-    # for i, t in enumerate(timesteps):
-    #     # 保存当前的带噪状态 x_t
-    #     if return_chain and i >= record_start_idx:
-    #         chains.append(trajectory.clone())
-            
-    #     # 调用底层的 UNet 进行预测，注意时间步的数据类型对齐
-    #     timestep_tensor = torch.full(trajectory.shape[:1], t, dtype=torch.long, device=device)
-    #     model_output = self.diffusion.unet(
-    #         trajectory,
-    #         timestep_tensor,
-    #         global_cond=global_cond
-    #     )
-        
-    #     # Scheduler 步进：求出更干净的 x_{t-1}
-    #     trajectory = self.diffusion.noise_scheduler.step(
-    #         model_output, t, trajectory
-    #     ).prev_sample
-
-    #     # 注入探索噪声 (除了最后一步)
-    #     std = getattr(self.config, "min_sampling_denoising_std", 0.05)
-    #     if i < len(timesteps) - 1:
-    #         trajectory = trajectory + torch.randn_like(trajectory) * std
     for i, t in enumerate(timesteps):
         # 🌟 保存当前的带噪状态 x_t
         if return_chain and i >= record_start_idx:
@@ -204,6 +180,9 @@ def get_logprobs(self, cond: dict, x_t: torch.Tensor, x_t_1: torch.Tensor, times
     # 3.2： 动态计算 DDIM 的真实“上一步”时间
     # 根据配置的 训练总步数 和 实际推理步数 算出跳跃步长
     scheduler = self.diffusion.noise_scheduler
+    # 🌟 修复：防御 actor_ref 未初始化的 NoneType 报错
+    if scheduler.num_inference_steps is None:
+        scheduler.set_timesteps(self.diffusion.num_inference_steps)
     step_ratio = scheduler.config.num_train_timesteps // scheduler.num_inference_steps
     prev_timesteps = timesteps - step_ratio
 
@@ -246,7 +225,7 @@ def get_logprobs(self, cond: dict, x_t: torch.Tensor, x_t_1: torch.Tensor, times
     # 🌟 官方对齐 3：在 Horizon 和 ActionDim 维度求均值 (替代 sum)
     # 官方源码：newlogprobs.mean(dim=(-1, -2)).view(-1)
     # ==========================================
-    log_prob = log_prob.mean(dim=(-1, -2))
+    log_prob = log_prob.sum(dim=(-1, -2))
 
     # 按需返回特征，用于评价网络的resnet视觉底座
     if return_global_cond:
@@ -419,7 +398,12 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     actor.to(device)  # 在所有 Gym 子进程全部 Spawn 安全启动后再 手动推入 GPU
     critic = SharedFeatureCritic(global_cond_dim=global_cond_dim).to(device)
     logging.info("✅ 成功初始化 Shared Critic (完美视觉底座共享模式)！")
-
+    import copy
+    logging.info("🧊 正在克隆并冻结预训练参考模型 (Reference Model)...")
+    actor_ref = copy.deepcopy(actor).to(device)
+    actor_ref.eval()  # 永远保持 eval 模式
+    for param in actor_ref.parameters():
+        param.requires_grad = False  # 彻底锁死梯度
     # ---------------------------------------------------------
     # 4.4 初始化独立的评估环境与 Top-K 快照管理器
     # ---------------------------------------------------------
@@ -438,8 +422,21 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # ==========================================
     # 5. 初始化优化器与超参数
     # ==========================================
-    actor_optimizer = torch.optim.AdamW(actor.parameters(), lr=cfg.training.actor_lr, weight_decay=getattr(cfg.training, "weight_decay", 1e-6))
+    # 🌟 修复 3：强行冻结视觉底座，只允许 RL 训练 UNet 动作去噪层
+    # 查找模型中包含 vision / backbone / image_proj 的参数并冻结
+    for name, param in actor.named_parameters():
+        # 根据 LeRobot 的层级命名，冻结视觉提取相关层
+        if "vision" in name.lower() or "backbone" in name.lower() or "encoder" in name.lower():
+            param.requires_grad = False
+
+    # 过滤出 requires_grad=True 的参数传给优化器
+    actor_trainable_params = [p for p in actor.parameters() if p.requires_grad]
+    actor_optimizer = torch.optim.AdamW(actor_trainable_params, lr=cfg.training.actor_lr, weight_decay=getattr(cfg.training, "weight_decay", 1e-6))
     critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=cfg.training.critic_lr)
+    # 在下方新增学习率热身调度器 (Warmup)
+    from torch.optim.lr_scheduler import LinearLR
+    # 前 5 轮迭代 (iters) 学习率从 10% 慢慢涨到 100%
+    actor_scheduler = LinearLR(actor_optimizer, start_factor=0.1, total_iters=5)
     logging.info(f"⚙️ 扩散模型调度器类型 (Scheduler Type): {actor.config.noise_scheduler_type}")
     logging.info(f"⚙️ 预测目标类型 (Prediction Type): {actor.config.prediction_type}")
     # 从配置中提取 RL 收集参数 (提供后备默认值)
@@ -448,7 +445,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     denoising_steps = getattr(cfg.policy, "ft_denoising_steps", 10)
     critic_warmup_iters = getattr(cfg.training, "n_critic_warmup_itr", 2) # critic网络先默认热身 2 轮
     ema_alpha = getattr(cfg.training, "reward_ema_alpha", 0.05) # 推荐 0.05 或 0.01
-    target_kl = getattr(cfg.training, "target_kl", 0.02)
+    target_kl = getattr(cfg.training, "target_kl", 0.01)
 
     # Gym 嵌套字典展平工具
     def flatten_lerobot_obs(obs_dict):
@@ -484,6 +481,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # ==========================================
     n_obs_steps = getattr(actor.config, "n_obs_steps", 2)
     use_disk_cache = getattr(cfg.training, "use_disk_cache", False)
+    running_reward_std = 1.0
     for itr in range(cfg.training.n_train_itr):
         logging.info(f"\n========== 第 {itr+1}/{cfg.training.n_train_itr} 轮迭代 ==========")
         
@@ -531,6 +529,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         for step in tqdm(range(n_steps), leave=False):
 
             # 将当前物理环境的画面压入历史队列
+            # key: "observation.images.zed", value: [96, 96, 3]
             for k, v in prev_obs.items():
                 if len(raw_obs_queue[k]) == 0:
                     """
@@ -548,9 +547,10 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             # 打包出带有时间维度 T 的状态 [n_envs, n_obs_steps, ...]
             stacked_raw_obs = {}
             for k in prev_obs.keys():
+                # [Batch, H, W, C] -> [Batch, T, H, W, C]   单环境：[H, W, C] -> [T, H, W, C]  
                 stacked_v = np.stack(list(raw_obs_queue[k]), axis=0 if n_envs == 1 else 1)
-                # 兼容单环境的 Batch 维度：确保最终形状是 [1, T, C, H, W]
                 if n_envs == 1:
+                    # 兼容单环境的 Batch 维度：[T, C, H, W] -> [1, T, C, H, W]
                     stacked_v = np.expand_dims(stacked_v, axis=0)
                 stacked_raw_obs[k] = stacked_v
             
@@ -571,22 +571,17 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
 
             # 1. 格式化当前单帧观测给 Actor 去推断 ，forward_dppo中会补成2帧进行推理
             batch_obs = {}
-            for k, v in prev_obs.items():
+            for k, v in stacked_raw_obs.items(): 
                 # 只提取模型 config 中真正需要的输入特征，防止 environment_state 引发报错
                 if k not in actor.config.input_shapes:
                     continue
                 safe_v = np.ascontiguousarray(v)
                 tensor_v = torch.from_numpy(safe_v).float().to(device)
 
-                # 兼容单环境
-                if n_envs == 1 and tensor_v.dim() == len(v.shape):
-                    # [H, W, C] -> [1, H, W, C]  [state] -> [1, state]
-                    tensor_v = tensor_v.unsqueeze(0)
-                
-                # 图像归一化与通道换位 (HWC -> CHW)
+                # 此时 tensor_v 已经是带有时间维度的 5D 形状了：[B, T, H, W, C]
                 if "images" in k:
-                    #  [Batch, H, W, C] -> [Batch, C, H, W]
-                    tensor_v = tensor_v.permute(0, 3, 1, 2) / 255.0
+                    # [Batch, Time, H, W, C] -> [Batch, Time, C, H, W]
+                    tensor_v = tensor_v.permute(0, 1, 4, 2, 3) / 255.0
                     
                 batch_obs[k] = tensor_v
 
@@ -601,6 +596,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 chains_venv = samples["chains"].cpu().numpy()   # shape: [n_envs, denoising_steps+1, horizon, action_dim]
 
             # 截取实际执行的动作长度 (Action Chunking)
+            # [B, act_steps, action_dim]
             action_venv = output_venv[:, :act_steps]
 
             # ==========================================
@@ -613,19 +609,17 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
 
             # 🌟 用于存放每个环境真正的 "原地待命" 动作
             # 形状需要和动作维度一致
-            if n_envs > 1:
-                safe_actions = np.zeros((n_envs, action_venv.shape[-1]), dtype=np.float32)
+            safe_actions = np.zeros((n_envs, action_venv.shape[-1]), dtype=np.float32)
 
             for step_i in range(act_steps):
                 curr_action = action_venv[:, step_i, :].copy() # 注意加 .copy()，防止修改原张量
                 
                 # 多环境动作冻结
-                if n_envs > 1:
-                    for env_idx in range(n_envs):
-                        # 如果某个环境已经死亡并重置，我们不能给它喂后续的垃圾动作。
-                        if any_done_accum[env_idx]:
-                            # 策略：一直给它发送死亡前最后一刻的安全动作，让机器人在重置原点尽量保持静止
-                            curr_action[env_idx] = safe_actions[env_idx]
+                for env_idx in range(n_envs):
+                    # 如果某个环境已经死亡并重置，我们不能给它喂后续的垃圾动作。
+                    if any_done_accum[env_idx]:
+                        # 策略：一直给它发送死亡前最后一刻的安全动作，让机器人在重置原点尽量保持静止
+                        curr_action[env_idx] = safe_actions[env_idx]
                 
                 action_to_step = curr_action[0] if n_envs == 1 else curr_action
                 obs_venv, reward_venv, terminated_venv, truncated_venv, info_venv = env.step(action_to_step)
@@ -641,24 +635,32 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 
                 # 只在环境第一次真正终止时标记
                 just_done = (terminated_venv | truncated_venv) & active_mask
-                true_term_accum = true_term_accum | (terminated_venv & active_mask)
+                true_term_accum = true_term_accum | (terminated_venv  & active_mask)
                 
                 # 在环境重置的瞬间，提取它真实的初始位姿作为安全动作！ (仅针对多进程环境)
-                if n_envs > 1:
-                    for env_idx in range(n_envs):
-                        if just_done[env_idx]:
-                            # 将重置后状态对应的真实关节角度作为安全动作
-                            safe_actions[env_idx] = obs_venv["observation.state"][env_idx][:action_venv.shape[-1]]
+                for env_idx in range(n_envs):
+                    if just_done[env_idx]:
+                        # 将重置后状态对应的真实关节角度作为安全动作。如果有状态就提取，纯视觉无状态就用 0 填充保持原位
+                        if "observation.state" in obs_venv:
+                            state_data = obs_venv["observation.state"]
+                            if n_envs == 1:
+                                safe_actions[env_idx] = state_data[:action_venv.shape[-1]]
+                            else:
+                                safe_actions[env_idx] = state_data[env_idx][:action_venv.shape[-1]]
+                        else:
+                            safe_actions[env_idx] = np.zeros(action_venv.shape[-1], dtype=np.float32)
 
                 any_done_accum = any_done_accum | terminated_venv | truncated_venv   
                 
-                # 完成任务或者超时后，重新初始化环境，继续收集数据
-                if n_envs == 1 and any_done_accum[0]:
-                    obs_venv, _ = env.reset()
-                    break
-
             prev_obs = obs_venv
-            
+            # 防止历史帧跨回合污染 (洗掉死亡环境的残影)
+            for env_idx in range(n_envs):
+                if any_done_accum[env_idx]:
+                    for k in prev_obs.keys():
+                        # 将该环境的队列中所有历史帧，全部强制覆写为重置后的第一帧，制造“静止”假象
+                        for q_idx in range(len(raw_obs_queue[k])):
+                            raw_obs_queue[k][q_idx][env_idx] = prev_obs[k][env_idx].copy()
+
             # 4. 顺手统计回合总奖励 (用于日志打印)
             running_ep_rewards += chunk_reward
             for env_idx in range(n_envs):
@@ -668,7 +670,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             
             # 5. 写入轨迹 Buffer，将这 8 步累积的完整奖励和结束标志，交给外部的 PPO 缓冲区
             for k in obs_trajs:
-                # 写入刚刚打包好的完整历史帧
+                # 记录每一步的完整历史帧
                 obs_trajs[k][step] = stacked_raw_obs[k]
                 
             chains_trajs[step] = chains_venv             # [n_steps, n_envs, denoising_steps + 1, horizon_steps, action_dim]
@@ -688,6 +690,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         
         obs_flat = {}
         for k, v in obs_trajs.items():
+            # [n_steps, n_envs, T, H, W, C] -> [(步数*环境数), T, H, W, C]
             obs_flat[k] = v.reshape(n_steps * n_envs, *v.shape[2:])
         
         with torch.no_grad():
@@ -708,8 +711,8 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                         tensor_v = tensor_v.permute(0, 1, 4, 2, 3) / 255.0
                     obs_chunk[k] = tensor_v
                 
-                # 🌟 调用 Actor 的特征提取底座
-                obs_chunk_norm = actor.normalize_inputs(obs_chunk)
+                # 调用 Actor 的特征提取底座
+                obs_chunk_norm = actor.normalize_inputs(obs_chunk) # 归一化输入
                 if len(actor.expected_image_keys) > 0:
                     obs_chunk_norm["observation.images"] = torch.stack([obs_chunk_norm[k] for k in actor.expected_image_keys], dim=-4)
                 
@@ -718,21 +721,24 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 values_flat[i:end_i] = critic(global_cond.detach()).cpu().numpy().flatten()
                 
             values_trajs = values_flat.reshape(n_steps, n_envs)
-            
             # 计算最后一步的 Next Value (Bootstrap)
             # 1. 补齐时间维度：将最新的单帧 prev_obs 塞入历史队列
             # 因为 Actor 的视觉底座需要 n_obs_steps 层历史帧才能前向传播
-            for k, v in prev_obs.items():
-                raw_obs_queue[k].append(v)
+            # for k, v in prev_obs.items():
+            #     raw_obs_queue[k].append(v)
                 
             last_obs_ts = {}
             for k, v in prev_obs.items():
                 # 过滤不需要的键值
                 if k not in actor.config.input_shapes:
                     continue
-                    
-                # 从队列中提取包含了完整历史帧 (Time) 的数据
-                stacked_v = np.stack(list(raw_obs_queue[k]), axis=0 if n_envs == 1 else 1)
+                # 复制全局队列为局部 list，并追加最新帧
+                temp_queue = list(raw_obs_queue[k])
+                temp_queue.append(v)
+                # 弹出最早的一帧，保持时序长度严格等于 n_obs_steps
+                temp_queue = temp_queue[1:]    
+                # 使用构造好的未来帧队列进行堆叠
+                stacked_v = np.stack(temp_queue, axis=0 if n_envs == 1 else 1)
                 tensor_v = torch.from_numpy(stacked_v).float().to(device)
                 
                 # 兼容单环境: [Time, ...] -> [1, Time, ...]
@@ -782,7 +788,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
 
         for t in reversed(range(n_steps)):
             # 获取下一步的 观测评估价值
-            next_val = next_values_last if t == n_steps - 1 else values_trajs[t + 1]
+            next_val = (next_values_last if t == n_steps - 1 else values_trajs[t + 1])
             # 判断游戏是否结束，如果nonterminal为0，表示死亡或通关，那么未来价值都是0
             nonterminal = 1.0 - terminated_trajs[t]
 
@@ -797,6 +803,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         # Advantage = Return - Value,       优势 = 实际总回报 - 预期总回报
         # aritic网络输出的是当前画面对应的未来总回报  Return = Advantage + Value，
         returns_trajs = advantages_trajs + values_trajs # 用于训练critic网络
+        logging.info(f"👉 [排查] Critic 预测 Value 均值: {values_trajs.mean():.4f}, 真实 Return 均值: {returns_trajs.mean():.4f}")
 
         # =========================================================
         # 6. DPPO 多轮小批量更新 (Update Epochs)
@@ -804,31 +811,14 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         # 🌟 优化 1：统一提取 PPO 核心超参数，确保日志与实际运行绝对一致
         batch_size = getattr(cfg.training, "batch_size", 32)
         update_epochs = getattr(cfg.training, "update_epochs", 10)
-        clip_ratio = getattr(cfg.training, "clip_ratio", 0.25)
+        clip_ratio = getattr(cfg.training, "clip_ratio", 0.01)
 
         logging.info(f"🔄 开始 PPO 网络更新 (Epochs: {getattr(cfg.training, 'update_epochs', 4)})...")
-        actor.train()
-        critic.train()
 
-        # 🌟 核心修复：强制冻结视觉底座的 BatchNorm 层，防止小 Batch 引起的统计量震荡导致的虚假 KL 爆炸
-        def freeze_bn(m):
-            classname = m.__class__.__name__
-            if classname.find('BatchNorm') != -1:
-                m.eval()
-                # 可选：如果完全不想更新底座特征，连梯度也关掉
-                # m.weight.requires_grad = False
-                # m.bias.requires_grad = False
-
-        # 应用到 Actor 的视觉底座和 Critic 网络
-        actor.apply(freeze_bn)
-        critic.apply(freeze_bn)
 
         # 1. 准备训练用的展平张量
         returns_k = torch.from_numpy(returns_trajs).float().to(device).reshape(-1)
         advantages_k = torch.from_numpy(advantages_trajs).float().to(device).reshape(-1)
-        
-        # 提取旧的价值预估张量，用于 价值截断Value Clipping，让critic网络更新更稳定
-        values_k = torch.from_numpy(values_trajs).float().to(device).reshape(-1)
 
         # 优势函数归一化 (防止太小更新太慢，极大地提升 PPO 训练稳定性)
         advantages_k = (advantages_k - advantages_k.mean()) / (advantages_k.std() + 1e-8)
@@ -887,6 +877,20 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         running_pg_loss = []
 
         # 2. 开始 Epoch 循环，PPO的数据集可以训练多轮，数据利用率高
+        actor.train()
+        critic.train()
+        # 强制冻结视觉底座的 BatchNorm 层，防止小 Batch 引起的统计量震荡导致的虚假 KL 爆炸
+        def freeze_bn(m):
+            classname = m.__class__.__name__
+            if classname.find('BatchNorm') != -1:
+                m.eval()
+                # 可选：如果完全不想更新底座特征，连梯度也关掉
+                # m.weight.requires_grad = False
+                # m.bias.requires_grad = False
+
+        # 应用到 Actor 的视觉底座和 Critic 网络
+        actor.apply(freeze_bn)
+        critic.apply(freeze_bn)
         early_stop = False
         for epoch in tqdm(range(update_epochs), desc=f"⏳ PPO 更新中 (Iter {itr+1})", leave=False):
             # 每一轮 Epoch 开始前检查，如果已熔断，彻底跳出 Epoch 循环，开启新的一轮迭代
@@ -925,8 +929,6 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                     # 完整数据给 Actor
                     obs_b[k] = tensor_v
                 
-
-
                 # ===================================================
                 # 从硬盘 (或系统内存) 按需拉取这一小批动作切片到 GPU
                 # ===================================================
@@ -941,18 +943,13 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 # 越接近输出端 (denoising_inds_b 越大)，折扣越接近 1.0
                 # ==========================================
                 gamma_denoising = getattr(cfg.training, "gamma_denoising", 0.99)
-                # 公式完全复刻官方: gamma ** (ft_denoising_steps - i - 1)
+                # 将时刻t的优势值乘以折扣因子: gamma ** (ft_denoising_steps - i - 1)
                 discount = gamma_denoising ** (denoising_steps - denoising_inds_b - 1)
                 advantages_b = advantages_b * discount
 
-                # 取出对应样本的旧价值预估
-                old_values_b = values_k[batch_inds_b]
                 # 取出旧策略的对数概率
                 old_logprobs_b = old_logprobs_k[inds_b]
                 
-                #  使用 set_to_none=True 节省大量显存
-                actor_optimizer.zero_grad(set_to_none=True)
-                critic_optimizer.zero_grad(set_to_none=True)
                 
                 # ----------------------------------------------------
                 # 🌟 网络 Loss 计算区 (共享计算底座)
@@ -976,21 +973,25 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 surr2 = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio) * advantages_b
                 pg_loss = -torch.min(surr1, surr2).mean()
                 
-                # 4. Critic 的打分损失 (🌟 军师直接看 Actor 传来的带有梯度的特征图！)
-                values_pred = critic(global_cond_b).squeeze(-1)
-                
-                # 限制当前价值预测值相对于旧价值的变动幅度，防止价值更新步子太大、训练震荡。
-                values_pred_clipped = old_values_b + torch.clamp(
-                    values_pred - old_values_b, -clip_ratio, clip_ratio
-                )
-                # 用smooth_l1_loss代替mse_loss计算两个 Loss，对异常值不敏感，训练更稳
-                v_loss_unclipped = torch.nn.functional.smooth_l1_loss(values_pred, returns_b, reduction="none")
-                v_loss_clipped = torch.nn.functional.smooth_l1_loss(values_pred_clipped, returns_b, reduction="none")
-                
-                # 取最大值，意味着只要截断前或截断后的误差有一个变大了，我们就用大的那个惩罚它
-                v_loss = torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                # 4. Critic 的打分损失 (直接使用 Smooth L1 Loss，无需截断，让其自由拟合真实价值)
+                values_pred = critic(global_cond_b.detach()).squeeze(-1)
+                v_loss = torch.nn.functional.smooth_l1_loss(values_pred, returns_b)
+
+                # 5.计算 BC Loss (行为克隆正则化)
+                with torch.no_grad():
+                    # 让“冻结的预训练老师”看看当前的状态，问它：“你会怎么做？”
+                    ref_logprobs_b = actor_ref.get_logprobs(
+                        cond=obs_b, 
+                        x_t=chains_prev_b, 
+                        x_t_1=chains_next_b, 
+                        timesteps=timesteps_b,
+                        return_global_cond=False
+                    )
+                bc_coef = getattr(cfg.training, "bc_loss_coef", 0.1)
+                # 计算当前策略与老师策略的 MSE 差异 (近似 KL 散度惩罚)
+                bc_loss = torch.nn.functional.mse_loss(new_logprobs_b, ref_logprobs_b)
                 # 5. 总 Loss 汇总, 反向传播时，pg_loss流向策略网络，v_loss流向价值网络
-                loss = pg_loss + 0.5 * v_loss   
+                loss = pg_loss + 0.5 * v_loss + bc_coef * bc_loss
 
                 running_v_loss.append(v_loss.item())
                 running_pg_loss.append(pg_loss.item())
@@ -1004,7 +1005,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
 
                     # 🌟 修复 2：极其重要！必须手动销毁所有带梯度的局部变量，释放几 GB 的计算图！
                     try:
-                        del loss, pg_loss, v_loss, new_logprobs_b, log_ratio, ratio, surr1, surr2, values_pred, v_loss_unclipped, v_loss_clipped
+                        del loss, pg_loss, v_loss, new_logprobs_b, log_ratio, ratio, surr1, surr2, values_pred
                     except Exception:
                         pass
                     
@@ -1015,35 +1016,51 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
 
                     break # 跳出当前batch
 
-
+                # ==========================================
+                # 🌟 加入梯度累加 (Gradient Accumulation)
+                # ==========================================
+                grad_accum_steps = getattr(cfg.training, "grad_accumulate", 15) # 如果你显存小，设为4或8
+                
+                # 缩小当前 batch 的 loss 比例
+                loss = loss / grad_accum_steps
                 loss.backward()
                 
-                torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
-                torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-
-                # critic网络需要一直更新
-                critic_optimizer.step()
-                # 只有当迭代轮次超过热身期，才允许更新 Actor 的预训练权重
-                if itr >= critic_warmup_iters:
-                    actor_optimizer.step()
-                    # 🌟 核心修复 3：同步更新模型的 EMA 平滑权重！这是评估成绩的关键！
-                    if hasattr(actor, "update"):
-                        with torch.no_grad():
-                            actor.update()
-                
+                # 累计满足设定的步数，或者达到最后一个 batch 时，才真正更新权重
+                if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1 == num_batch):
+                    torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+                    
+                    critic_optimizer.step()
+                    if itr >= critic_warmup_iters:
+                        actor_optimizer.step()
+                        
+                                
+                    # 更新完后务必清空梯度！
+                    actor_optimizer.zero_grad(set_to_none=True)
+                    critic_optimizer.zero_grad(set_to_none=True)
+        # 跑完一整轮环境交互 (Iteration)，让学习率步进一次
+        if itr >= critic_warmup_iters:
+            actor_scheduler.step()
+            # 同步更新模型的 EMA 平滑权重
+            if hasattr(actor, "update"):
+                with torch.no_grad():
+                    actor.update()    
         # =========================================================
         # 🌟 修复 4：PPO 阶段结束，清扫全部巨大的训练经验张量，让显存归还给评估和下一次 Rollout
         # =========================================================
         try:
-            del chains_flat, returns_k, advantages_k, values_k, old_logprobs_k, obs_flat
-            # 如果开启了硬盘缓存，必须显式调用 cleanup() 删除物理文件
+            del loss, pg_loss, v_loss, new_logprobs_b, log_ratio, ratio, surr1, surr2, values_pred
+            
+            # 🌟 终极修复：把本轮所有的巨型 Buffer 全部粉碎！释放物理内存与文件读写锁！
+            del chains_flat, obs_flat, chains_trajs, obs_trajs, returns_k, advantages_k, old_logprobs_k
+            import gc
+            gc.collect()
+            # 必须在底层文件锁 (memmap) 被 del 释放之后，清理临时文件夹才能真正生效
             if use_disk_cache and temp_buffer_dir is not None:
-                temp_buffer_dir.cleanup()
+                temp_buffer_dir.cleanup() # 如果开启了硬盘缓存，必须显式调用 cleanup() 删除物理文件
         except Exception:
             pass
         torch.cuda.empty_cache()
-        import gc
-        gc.collect()
 
         # ------------------------------------------
         # 步骤 E：打印评估指标 (替代原论文代码)
@@ -1162,7 +1179,7 @@ if __name__ == "__main__":
         "policy=ft_zed_wrist_diffusion",
         "training.pretrained_ckpt_path='outputs/1.hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion'",
         "env.n_envs=10",
-        "training.rollout_steps=200", 
+        "training.rollout_steps=40", 
         "training.batch_size=8",     
         "training.update_epochs=2",     
         "wandb.enable=false",

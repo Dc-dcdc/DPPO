@@ -10,8 +10,9 @@ if "HF_ENDPOINT" in os.environ:
 os.environ["http_proxy"] = "http://127.0.0.1:7897"
 os.environ["https_proxy"] = "http://127.0.0.1:7897"
 
-# 3. 填入你刚才测试成功的 Token
-MY_HF_TOKEN = "XXXXXXXXXXXXXXXXXXXXX"
+MY_HF_TOKEN = os.environ.get("HF_TOKEN")
+if not MY_HF_TOKEN:
+    raise RuntimeError("请先设置 Hugging Face token: export HF_TOKEN=你的token，不要把 token 写进代码。")
 
 def push_model_folder_to_hf(local_dir, repo_id, commit_message="Upload model"):
     # 强制在代码层面登录

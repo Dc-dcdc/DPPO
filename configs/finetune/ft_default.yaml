@@ -3,7 +3,7 @@
 # 🌟 核心：告诉 Hydra 去哪里拉取基础配置
 defaults:
   - _self_                      # 允许本文件覆盖上面的默认值
-  - policy: ft_zed_diffusion   
+  - policy: ft_zed_wrist_diffusion
 
 resume: false
 resume_path: none
@@ -18,12 +18,26 @@ hydra:
 
 training:
   pretrained_ckpt_path: "outputs/pretrain/train/.../checkpoints/050000"
-  min_sampling_denoising_std: 0.02  # 为 DDIM 采样注入的动作探索标准差，越大越随机，越小越稳定
-  min_logprob_denoising_std: 0.08  # 控制概率计算分母，过大会导致KL爆炸
-  reward_ema_alpha: 0.02 #滑动更新全局奖励方差
-  target_kl: 0.02
+  min_sampling_denoising_std: 0.02  # DDIM采样探索标准差；视觉机器人任务建议保持小而非0
+  min_logprob_denoising_std: 0.02   # 与采样标准差保持一致，避免old/new logprob尺度不匹配
+  reward_ema_alpha: 0.05            # 滑动更新全局奖励方差
+  target_kl: 0.02                   # PPO早停阈值；只在critic warmup之后生效
+  bc_loss_coef: 0.005               # teacher-action NLL正则；过大会把actor锁死在预训练附近
   lr_backbone: 1e-5
   use_disk_cache: True   # True 开启硬盘缓存 (省内存), False 开启纯内存模式 (速度最快)
+  grad_accumulate: 4     # 梯度累计步数
+  actor_lr_warmup_iters: 5
+  rollout_policy: dppo   # dppo: DPPO采样；select_action: 复用eval推理，只做排查
+  skip_update: false     # true时只采集rollout，不更新Actor/Critic
+  update_actor: true      # false时只训练Critic，用于定位是否Actor更新导致策略退化
+  ref_bc_early_stop: 4.0  # 当前Actor相对预训练参考模型偏离过大时，停止本轮Actor更新
+  min_actor_update_success_rate: 0.1  # rollout低于该成功率且奖励很差时，本轮只训Critic
+  min_actor_update_avg_return: -100.0
+  rollback_on_eval_collapse: true     # 是否在评估时检测到性能崩溃（成功率骤降）时回滚到之前的好模型
+  rollback_success_rate: 0.1
+  rollback_reward: -100.0
+  rollback_patience: 1
+
 
 eval:
   checkpoint_metric: "reward" # 筛选指标：可选 'loss' 或 'reward'
