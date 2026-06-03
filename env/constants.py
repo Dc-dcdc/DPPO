@@ -63,13 +63,19 @@ SIM_TASK_CONFIGS = {
     },
 }
 
+"""
+MuJoCo内部物理频率: 500 Hz
+env.step动作执行频率: 25 Hz 40ms
+Diffusion重新推理频率: 3.125 Hz(包含8个动作步骤，每个动作步长40ms，总共320ms)，即每320ms重新推理一次动作块
+每次推理执行动作块长度: 8步 = 0.32秒
+"""
 # control parameters
 #上位机（主控电脑）每秒钟 50 次去读取 VR 头显和手柄的位姿（Pose），进行逆运动学（IK）解算，并将计算出的关节目标角度下发给真实的机械臂底层电机
 REAL_DT = 0.02 # 控制回路（发送指令给电机、读取传感器）的运行频率是 50 Hz
 
 # physics parameters
 SIM_PHYSICS_DT=0.002 # 物理引擎（计算刚体动力学、碰撞、摩擦力等）每 0.002 秒（500 Hz）进行一次演算。
-SIM_DT = 0.04  #读取操作员动捕设备或AI算法输出的动作的频率：25HZ
+SIM_DT = 0.04  #读取操作员动捕设备或模型推理动作的频率：25HZ, 40ms
 SIM_PHYSICS_ENV_STEP_RATIO = int(SIM_DT/SIM_PHYSICS_DT) #AI 每输出一个动作，仿真器会在底层保持这个动作不变，连续运行 20 次物理演算（每次 0.002 秒），然后再把第 20 次演算后的最新状态返回给 AI。
 SIM_DT = SIM_PHYSICS_DT * SIM_PHYSICS_ENV_STEP_RATIO # 强制确保最终的 SIM_DT 绝对是底层物理步长的整数倍，这样可以保证仿真器的稳定性
 

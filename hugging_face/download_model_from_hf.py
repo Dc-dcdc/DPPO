@@ -45,8 +45,8 @@ if __name__ == "__main__":
     # 目标仓库
     TARGET_REPO_ID = "Dc-dc/pre_sim_sew_needle_3arms_zed_wrist_diffusion"
     
-    # 本地文件夹，会在后面自动创建任务和使用相机名称
-    BASE_PRETRAIN_DIR = "outputs/1.hugging_model"
+    # 本地文件夹，会在后面自动创建任务+相机名称
+    BASE_PRETRAIN_DIR = "outputs/1_hugging_model"
     
     # 2. 调用函数执行下载
     download_model_to_pretrain(

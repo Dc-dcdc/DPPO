@@ -5,6 +5,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True" # 开启 PyTo
 # os.environ["EGL_DEVICE_ID"] = "0"
 import sys
 import math
+import json
 import torch
 import numpy as np
 import logging
@@ -25,7 +26,7 @@ from lerobot.common.policies.factory import make_policy
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
-import env.sim_envs
+import env.task.sim_envs
 from lerobot.common.policies.diffusion.modeling_diffusion import DiffusionPolicy
 from lerobot.common.utils.utils import get_safe_torch_device
 from lerobot.common.policies.utils import (
@@ -38,6 +39,128 @@ from contextlib import nullcontext
 
 import torch
 from types import MethodType
+
+
+def deep_update_dict(base: dict, override: dict) -> dict:
+    """递归合并配置字典；override 中的值优先。"""
+    merged = dict(base or {})
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_update_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def compute_value_diagnostics(values, returns, eps: float = 1e-8):
+    """计算 critic 的解释方差和 value/return 相关性。"""
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    returns = np.asarray(returns, dtype=np.float64).reshape(-1)
+
+    if values.size == 0 or returns.size == 0:
+        return float("nan"), float("nan")
+
+    return_var = np.var(returns)
+    if return_var < eps:
+        explained_variance = float("nan")
+    else:
+        explained_variance = 1.0 - np.var(returns - values) / (return_var + eps)
+
+    value_std = np.std(values)
+    return_std = np.std(returns)
+    if values.size < 2 or value_std < eps or return_std < eps:
+        value_return_corr = float("nan")
+    else:
+        value_return_corr = float(np.corrcoef(values, returns)[0, 1])
+
+    return float(explained_variance), value_return_corr
+
+
+def init_logprob_advantage_stats():
+    """初始化 PPO 更新方向诊断的累计量。"""
+    return {
+        "n": 0,
+        "sum_x": 0.0,
+        "sum_y": 0.0,
+        "sum_x2": 0.0,
+        "sum_y2": 0.0,
+        "sum_xy": 0.0,
+        "pos_n": 0,
+        "pos_logratio_sum": 0.0,
+        "neg_n": 0,
+        "neg_logratio_sum": 0.0,
+        "sign_n": 0,
+        "sign_agree": 0,
+    }
+
+
+@torch.no_grad()
+def update_logprob_advantage_stats(stats, log_ratio, advantages, eps: float = 1e-12):
+    """累计 logprob 变化和 advantage 的相关性统计。"""
+    x = log_ratio.detach().float().reshape(-1)
+    y = advantages.detach().float().reshape(-1)
+    finite_mask = torch.isfinite(x) & torch.isfinite(y)
+    if not finite_mask.any():
+        return
+
+    x = x[finite_mask]
+    y = y[finite_mask]
+    stats["n"] += int(x.numel())
+    stats["sum_x"] += float(x.sum().item())
+    stats["sum_y"] += float(y.sum().item())
+    stats["sum_x2"] += float((x * x).sum().item())
+    stats["sum_y2"] += float((y * y).sum().item())
+    stats["sum_xy"] += float((x * y).sum().item())
+
+    pos_mask = y > eps
+    if pos_mask.any():
+        stats["pos_n"] += int(pos_mask.sum().item())
+        stats["pos_logratio_sum"] += float(x[pos_mask].sum().item())
+
+    neg_mask = y < -eps
+    if neg_mask.any():
+        stats["neg_n"] += int(neg_mask.sum().item())
+        stats["neg_logratio_sum"] += float(x[neg_mask].sum().item())
+
+    sign_mask = torch.abs(y) > eps
+    if sign_mask.any():
+        stats["sign_n"] += int(sign_mask.sum().item())
+        stats["sign_agree"] += int(((x[sign_mask] * y[sign_mask]) > 0).sum().item())
+
+
+def finalize_logprob_advantage_stats(stats, eps: float = 1e-12):
+    """输出 PPO 更新方向诊断指标。"""
+    n = stats["n"]
+    if n < 2:
+        corr = float("nan")
+    else:
+        mean_x = stats["sum_x"] / n
+        mean_y = stats["sum_y"] / n
+        var_x = stats["sum_x2"] / n - mean_x * mean_x
+        var_y = stats["sum_y2"] / n - mean_y * mean_y
+        cov_xy = stats["sum_xy"] / n - mean_x * mean_y
+        if var_x <= eps or var_y <= eps:
+            corr = float("nan")
+        else:
+            corr = cov_xy / math.sqrt(var_x * var_y)
+
+    pos_mean = (
+        stats["pos_logratio_sum"] / stats["pos_n"]
+        if stats["pos_n"] > 0
+        else float("nan")
+    )
+    neg_mean = (
+        stats["neg_logratio_sum"] / stats["neg_n"]
+        if stats["neg_n"] > 0
+        else float("nan")
+    )
+    sign_agreement = (
+        stats["sign_agree"] / stats["sign_n"]
+        if stats["sign_n"] > 0
+        else float("nan")
+    )
+    return corr, pos_mean, neg_mean, sign_agreement
+
 
 @torch.no_grad()
 def forward_dppo(self, cond: dict, return_chain=True):
@@ -222,10 +345,17 @@ def get_logprobs(self, cond: dict, x_t: torch.Tensor, x_t_1: torch.Tensor, times
     log_prob = torch.clamp(log_prob, min=-5.0, max=2.0)
 
     # ==========================================
-    # 🌟 官方对齐 3：在 Horizon 和 ActionDim 维度求均值 (替代 sum)
-    # 官方源码：newlogprobs.mean(dim=(-1, -2)).view(-1)
+    # PPO ratio 应该基于被执行 action chunk 的联合概率。
+    # mean 会把梯度按 n_action_steps * action_dim 稀释，本任务为 8 * 21 = 168 倍。
+    # 如需复现实验，可在配置里设为 "mean"。
     # ==========================================
-    log_prob = log_prob.mean(dim=(-1, -2))
+    logprob_reduction = getattr(self.config, "logprob_reduction", "sum")
+    if logprob_reduction == "sum":
+        log_prob = log_prob.sum(dim=(-1, -2))
+    elif logprob_reduction == "mean":
+        log_prob = log_prob.mean(dim=(-1, -2))
+    else:
+        raise ValueError(f"未知 logprob_reduction={logprob_reduction!r}，可选: 'sum' 或 'mean'")
 
     # 按需返回特征，用于评价网络的resnet视觉底座
     if return_global_cond:
@@ -240,7 +370,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # 1. 基础配置与日志初始化
     # ==========================================
     init_logging()
-    logging.info("🚀 启动 DPPO 微调程序...")
+    logging.info("  启动 DPPO 微调程序...")
     logging.info(f"配置参数:\n{pformat(OmegaConf.to_container(cfg))}")
 
     # 初始化日志记录器与全局随机种子
@@ -249,7 +379,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
 
     # 获取设备
     device = get_safe_torch_device(cfg.device, log=True)
-    logging.info(f"💻 运行设备已绑定: {device}")
+    logging.info(f"  运行设备已绑定: {device}")
 
     # ==========================================
     # 2. 权重路径检测与 Actor 网络加载
@@ -265,7 +395,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         load_dir = hf_model_dir
     else:
         load_dir = ckpt_path # 兼容其他保存格式
-    logging.info(f"💾 正在从目录重建网络并加载权重: {load_dir}")
+    logging.info(f"  正在从目录重建网络并加载权重: {load_dir}")
 
     hydra_cfg = None
     try:
@@ -289,32 +419,28 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             pretrained_policy_name_or_path=str(load_dir)
         )
 
-        logging.info("✅ 成功使用 make_policy 加载策略！底层 Normalizer 与平滑权重已自动生效。")
+        logging.info("  成功使用 make_policy 加载策略！底层 Normalizer 与平滑权重已自动生效。")
 
         # 单独注入 DPPO 微调需要的超参数，保持采样分布和 logprob 分布一致。
         min_sampling_std = float(getattr(cfg.training, "min_sampling_denoising_std", 0.04))
         min_logprob_std = float(getattr(cfg.training, "min_logprob_denoising_std", min_sampling_std))
+        logprob_reduction = str(getattr(cfg.training, "logprob_reduction", "sum"))
         actor.config.min_sampling_denoising_std = min_sampling_std
         actor.config.min_logprob_denoising_std = min_logprob_std
+        actor.config.logprob_reduction = logprob_reduction
         actor.config.ft_denoising_steps = int(
             getattr(cfg.policy, "ft_denoising_steps", getattr(actor.config, "ft_denoising_steps", 5))
         )
         actor.config.n_action_steps = int(
             getattr(cfg.policy, "n_action_steps", getattr(actor.config, "n_action_steps", 8))
         )
-        logging.info(
-            "✅ DPPO策略参数: ft_denoising_steps=%s, n_action_steps=%s, sampling_std=%.4f, logprob_std=%.4f",
-            actor.config.ft_denoising_steps,
-            actor.config.n_action_steps,
-            actor.config.min_sampling_denoising_std,
-            actor.config.min_logprob_denoising_std,
-        )
-        logging.info("✅ 成功将微调配置 (YAML) 注入到 Actor 内部 config 中！")
+
+        logging.info("  成功将微调配置 (YAML) 注入到 Actor 内部 config 中！")
 
         # 动态挂载 DPPO 专用的前向与概率计算函数
         actor.forward_dppo = MethodType(forward_dppo, actor) # 将forward_dppo绑定到实例中
         actor.get_logprobs = MethodType(get_logprobs, actor) # 将get_logprobs绑定到实例中
-        logging.info("✅ 成功加载 Actor (DiffusionPolicy) 并挂载 DPPO 专用接口！")
+        logging.info("  成功加载 Actor (DiffusionPolicy) 并挂载 DPPO 专用接口！")
 
     except Exception as e:
         raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
@@ -385,10 +511,10 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             context="spawn",     # 👈 强制安全启动子进程，防止 OpenGL/CUDA 崩溃
             autoreset_mode="SameStep",
         )
-        logging.info(f"✅ 成功启动 {n_envs} 个并行多进程环境 (AsyncVectorEnv) ...")
+        logging.info(f"  成功启动 {n_envs} 个并行多进程环境 (AsyncVectorEnv) ...")
     else:
         env = gym.make(id=env_id, cameras=obs_cameras)
-        logging.info("✅ 成功启动单环境模式...")
+        logging.info("  成功启动单环境模式...")
 
     # ---------------------------------------------------------
     # 4.3 动态推断特征维度并初始化 Shared Critic
@@ -401,13 +527,13 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         dummy_cond = actor.diffusion._prepare_global_conditioning(dummy_batch)
         global_cond_dim = dummy_cond.shape[-1]
 
-    logging.info(f"🧠 动态探测到 Actor 视觉底座输出特征维度为: {global_cond_dim}")
+    logging.info(f"动态探测到 Actor 视觉底座输出特征维度为: {global_cond_dim}")
 
     actor.to(device)  # 在所有 Gym 子进程全部 Spawn 安全启动后再 手动推入 GPU
     critic = SharedFeatureCritic(global_cond_dim=global_cond_dim).to(device)
-    logging.info("✅ 成功初始化 Shared Critic (完美视觉底座共享模式)！")
+    logging.info("成功初始化 Shared Critic (完美视觉底座共享模式)！")
     import copy
-    logging.info("🧊 正在克隆并冻结预训练参考模型 (Reference Model)...")
+    logging.info("正在克隆并冻结预训练参考模型 (Reference Model)...")
     actor_ref = copy.deepcopy(actor).to(device)
     actor_ref.forward_dppo = MethodType(forward_dppo, actor_ref)
     actor_ref.get_logprobs = MethodType(get_logprobs, actor_ref)
@@ -417,7 +543,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # ---------------------------------------------------------
     # 4.4 初始化独立的评估环境与 Top-K 快照管理器
     # ---------------------------------------------------------
-    logging.info("🎬 正在初始化独立的评估环境 (Eval Env)...")
+    logging.info("正在初始化独立的评估环境 (Eval Env)...")
     # 评估环境不需要向量化并发，只需一个单例环境即可
     eval_env = gym.make(id=env_id, cameras=obs_cameras)
 
@@ -432,17 +558,43 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     # ==========================================
     # 5. 初始化优化器与超参数
     # ==========================================
-    # 🌟 修复 3：强行冻结视觉底座，只允许 RL 训练 UNet 动作去噪层
-    # 查找模型中包含 vision / backbone / image_proj 的参数并冻结
+    def is_vision_encoder_param(param_name: str) -> bool:
+        """只冻结视觉底座；不要误伤 UNet 内部的 cond_encoder / diffusion_step_encoder。"""
+        name = param_name.lower()
+        return (
+            "rgb_encoder" in name
+            or "image_encoder" in name
+            or "vision_encoder" in name
+            or "visual_encoder" in name
+            or ("backbone" in name and "unet" not in name)
+        )
+
+    # 冻结视觉底座，只允许 RL 训练 UNet 动作去噪层。
+    # 注意不要用泛化的 "encoder" 匹配，否则会冻结 UNet 的 diffusion_step_encoder 和 cond_encoder。
+    frozen_vision_params = 0
+    trainable_unet_params = 0
+    trainable_other_params = 0
     for name, param in actor.named_parameters():
-        # 根据 LeRobot 的层级命名，冻结视觉提取相关层
-        if "vision" in name.lower() or "backbone" in name.lower() or "encoder" in name.lower():
+        if is_vision_encoder_param(name):
             param.requires_grad = False
+            frozen_vision_params += param.numel()
+        else:
+            param.requires_grad = True
+            if "unet" in name.lower():
+                trainable_unet_params += param.numel()
+            else:
+                trainable_other_params += param.numel()
 
     # 过滤出 requires_grad=True 的参数传给优化器
     actor_trainable_params = [p for p in actor.parameters() if p.requires_grad]
     actor_optimizer = torch.optim.AdamW(actor_trainable_params, lr=cfg.training.actor_lr, weight_decay=getattr(cfg.training, "weight_decay", 1e-6))
     critic_optimizer = torch.optim.AdamW(critic.parameters(), lr=cfg.training.critic_lr)
+    logging.info(
+        "  Actor冻结/训练参数统计: frozen_vision=%.2fM, trainable_unet=%.2fM, trainable_other=%.2fM",
+        frozen_vision_params / 1e6,
+        trainable_unet_params / 1e6,
+        trainable_other_params / 1e6,
+    )
 
     def snapshot_actor_state():
         return {k: v.detach().cpu().clone() for k, v in actor.state_dict().items()}
@@ -466,8 +618,8 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         start_factor=0.1,
         total_iters=getattr(cfg.training, "actor_lr_warmup_iters", 5),
     )
-    logging.info(f"⚙️ 扩散模型调度器类型 (Scheduler Type): {actor.config.noise_scheduler_type}")
-    logging.info(f"⚙️ 预测目标类型 (Prediction Type): {actor.config.prediction_type}")
+    logging.info(f"  扩散模型调度器类型 (Scheduler Type): {actor.config.noise_scheduler_type}")
+    logging.info(f"  预测目标类型 (Prediction Type): {actor.config.prediction_type}")
     # 从配置中提取 RL 收集参数 (提供后备默认值)
     n_steps = getattr(cfg.training, "rollout_steps", 300)   # 每次更新前收集的步数
     act_steps = getattr(cfg.policy, "n_action_steps", 8)
@@ -483,7 +635,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     ema_alpha = getattr(cfg.training, "reward_ema_alpha", 0.05) # 推荐 0.05 或 0.01
     target_kl = getattr(cfg.training, "target_kl", 0.05)
     logging.info(
-        "⚙️ DPPO训练参数: rollout_steps=%s, act_steps=%s, action_slice=[%s:%s], ft_denoising_steps=%s, critic_warmup=%s, target_kl=%.4f",
+        "DPPO训练参数: rollout_steps=%s, act_steps=%s, action_slice=[%s:%s], ft_denoising_steps=%s, critic_warmup=%s, target_kl=%.4f",
         n_steps,
         act_steps,
         action_start,
@@ -642,7 +794,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         running_rewards = np.zeros(n_envs, dtype=np.float32)
         completed_rewards = []
         completed_successes = []
-        logging.info(f"🧪 诊断rollout: policy.select_action, no update, physical_env_steps={total_env_steps}")
+        logging.info(f"诊断rollout: policy.select_action, no update, physical_env_steps={total_env_steps}")
 
         for _ in tqdm(range(total_env_steps), desc="🧪 select_action rollout", leave=False):
             obs_tensor = build_select_action_obs(prev_obs)
@@ -699,11 +851,11 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
     valid_rollout_policies = {"dppo", "select_action"}
     if rollout_policy not in valid_rollout_policies:
         raise ValueError(f"training.rollout_policy 必须是 {valid_rollout_policies} 之一，当前是: {rollout_policy}")
-    logging.info(f"🧪 Rollout模式: {rollout_policy}, skip_update={skip_update}, update_actor={update_actor}")
+    logging.info(f"Rollout模式: {rollout_policy}, skip_update={skip_update}, update_actor={update_actor}")
     if rollout_policy == "select_action" and n_envs > 1:
         logging.warning("⚠️ select_action的动作队列不能按单个子环境reset；严格对齐eval.py时建议设置 env.n_envs=1。")
     if not update_actor:
-        logging.warning("🧪 training.update_actor=false：本次只训练Critic，Actor参数和EMA不会更新。")
+        logging.warning("  training.update_actor=false：本次只训练Critic，Actor参数和EMA不会更新。")
     running_reward_std = 1.0
     raw_obs_queue = {k: deque(maxlen=n_obs_steps) for k in prev_obs.keys()}
     reset_full_obs_queue(raw_obs_queue, prev_obs)
@@ -719,15 +871,15 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 avg_ep_return = np.mean(completed_ep_rewards)
                 max_ep_return = np.max(completed_ep_rewards)
                 success_rate = np.mean(completed_successes) if completed_successes else 0.0
-                logging.info(f"✅ select_action诊断第 {itr+1} 轮完成！")
-                logging.info(f"   🏃 完成回合数: {len(completed_ep_rewards)}")
-                logging.info(f"   🎯 成功率: {success_rate * 100:.1f}%")
-                logging.info(f"   💰 平均回合总奖励 (Return): {avg_ep_return:.2f}")
-                logging.info(f"   🏆 最高回合奖励: {max_ep_return:.2f}")
+                logging.info(f"  select_action诊断第 {itr+1} 轮完成！")
+                logging.info(f"-----完成回合数: {len(completed_ep_rewards)}")
+                logging.info(f"-----成功率: {success_rate * 100:.1f}%")
+                logging.info(f"-----平均回合总奖励 (Return): {avg_ep_return:.2f}")
+                logging.info(f"-----最高回合奖励: {max_ep_return:.2f}")
             else:
-                logging.info(f"⚠️ select_action诊断第 {itr+1} 轮没有完成回合，请增加 training.rollout_steps")
+                logging.info(f"select_action诊断第 {itr+1} 轮没有完成回合，请增加 training.rollout_steps")
 
-            logging.info("🧪 select_action模式不产生 diffusion chain，本轮跳过 PPO 更新。")
+            logging.info(f"select_action模式不产生 diffusion chain，本轮跳过 PPO 更新。")
             continue
 
         # ==========================================
@@ -745,7 +897,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             # 使用硬盘缓存
             temp_buffer_dir = tempfile.TemporaryDirectory()
             buffer_path = temp_buffer_dir.name
-            logging.info(f"💾 [缓存模式] 已开启硬盘缓存 (Memmap)，临时目录: {buffer_path}")
+            logging.info(f"  [缓存模式] 已开启硬盘缓存 (Memmap)，临时目录: {buffer_path}")
 
             chains_trajs = np.memmap(
                 os.path.join(buffer_path, 'chains_trajs.npy'),
@@ -755,7 +907,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             )         # (步数，环境数，去噪步数，预测步数，动作维度)
         else:
             temp_buffer_dir = None
-            logging.info("💾 [缓存模式] 使用纯内存 (RAM) 收集数据，追求极致速度...")
+            logging.info("  [缓存模式] 使用纯内存 (RAM) 收集数据，追求极致速度...")
             # (步数，环境数，去噪步数，预测步数，动作维度)
             chains_trajs = np.zeros(
                 (n_steps, n_envs, denoising_steps + 1, horizon_steps, action_dim),
@@ -770,7 +922,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         # 2. 开始收集环境交互数据 (Rollout Loop)
         # ==========================================
         actor.reset()
-        logging.info(f"🏃 开始进入数据收集循环 (共 {n_steps} 步)...")
+        logging.info(f"  开始进入数据收集循环 (共 {n_steps} 步)...")
         for step in tqdm(range(n_steps), leave=False):
 
             # 打包最近 n_obs_steps 个相邻物理帧；队列已在每个 env.step 后实时更新。
@@ -903,7 +1055,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             reward_trajs[step] = chunk_reward            # [n_steps, n_envs]
             terminated_trajs[step] = true_term_accum     # [n_steps, n_envs]
 
-        logging.info("✅ 数据收集 (Rollout) 完成，准备进入 PPO 网络更新阶段！")
+        logging.info("  数据收集 (Rollout) 完成，准备进入 PPO 网络更新阶段！")
         rollout_avg_return = np.mean(completed_ep_rewards) if completed_ep_rewards else float("-inf")
         rollout_success_rate = np.mean(completed_ep_successes) if completed_ep_successes else 0.0
         allow_actor_update_this_itr = True
@@ -917,7 +1069,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         ):
             allow_actor_update_this_itr = False
             logging.warning(
-                f"🧯 本轮rollout已明显退化(success={rollout_success_rate * 100:.1f}%, "
+                f"  本轮rollout已明显退化(success={rollout_success_rate * 100:.1f}%, "
                 f"return={rollout_avg_return:.2f})，跳过Actor更新，只训练Critic。"
             )
 
@@ -926,11 +1078,11 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 avg_ep_return = np.mean(completed_ep_rewards)
                 max_ep_return = np.max(completed_ep_rewards)
                 success_rate = np.mean(completed_ep_successes) if completed_ep_successes else 0.0
-                logging.info(f"✅ 第 {itr+1} 轮DPPO采集诊断完成！")
-                logging.info(f"   🏃 本轮共完成回合数: {len(completed_ep_rewards)}")
-                logging.info(f"   🎯 成功率: {success_rate * 100:.1f}%")
-                logging.info(f"   💰 平均回合总奖励 (Return): {avg_ep_return:.2f}")
-                logging.info(f"   🏆 最高回合奖励: {max_ep_return:.2f}")
+                logging.info(f"  第 {itr+1} 轮DPPO采集诊断完成！")
+                logging.info(f"     本轮共完成回合数: {len(completed_ep_rewards)}")
+                logging.info(f"     成功率: {success_rate * 100:.1f}%")
+                logging.info(f"     平均回合总奖励 (Return): {avg_ep_return:.2f}")
+                logging.info(f"     最高回合奖励: {max_ep_return:.2f}")
             else:
                 logging.info(f"⚠️ 第 {itr+1} 轮DPPO采集结束，但没有环境跑完一个完整回合")
 
@@ -1024,7 +1176,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         batch_reward_std = reward_trajs.std()
         if batch_reward_std > 1e-8:
             if itr == 0:
-                # 🚀 冷启动修复：第一轮直接使用真实的批次标准差，瞬间对齐量级！
+                #  冷启动修复：第一轮直接使用真实的批次标准差，瞬间对齐量级！
                 running_reward_std = batch_reward_std
             else:
                 # 动态更新全局标准差 (95% 的历史记忆 + 5% 的新知识)
@@ -1056,7 +1208,15 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         # Advantage = Return - Value,       优势 = 实际总回报 - 预期总回报
         # aritic网络输出的是当前画面对应的未来总回报  Return = Advantage + Value，
         returns_trajs = advantages_trajs + values_trajs # 用于训练critic网络
-        logging.info(f"👉 [排查] Critic 预测 Value 均值: {values_trajs.mean():.4f}, 真实 Return 均值: {returns_trajs.mean():.4f}")
+        critic_explained_variance, critic_value_return_corr = compute_value_diagnostics(
+            values_trajs,
+            returns_trajs,
+        )
+        logging.info(f"  [排查] Critic 预测 Value 均值: {values_trajs.mean():.4f}, 真实 Return 均值: {returns_trajs.mean():.4f}")
+        logging.info(
+            f"  [排查] Critic解释方差(EV): {critic_explained_variance:.4f}, "
+            f"Value/Return相关性: {critic_value_return_corr:.4f}"
+        )
 
         # =========================================================
         # 6. DPPO 多轮小批量更新 (Update Epochs)
@@ -1065,6 +1225,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         batch_size = getattr(cfg.training, "batch_size", 32)
         update_epochs = getattr(cfg.training, "update_epochs", 4)
         clip_ratio = getattr(cfg.training, "clip_ratio", 0.05)
+        gamma_denoising = getattr(cfg.training, "gamma_denoising", 0.99)
 
         logging.info(f"🔄 开始 PPO 网络更新 (Epochs: {getattr(cfg.training, 'update_epochs', 4)})...")
 
@@ -1094,7 +1255,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         # 7. 预计算旧策略的对数概率 (Old Logprobs)
         # =========================================================
         # 预计算旧概率时，同样按需从 CPU 搬运数据
-        logging.info("🧠 正在预计算旧策略概率基准...")
+        logging.info("  正在预计算旧策略概率基准...")
         actor.eval()
         old_logprobs_k = torch.zeros(total_steps, device=device)
         with torch.no_grad():
@@ -1128,6 +1289,28 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 old_logprobs_k[inds] = logprobs
 
         actor_update_this_itr = allow_actor_update_this_itr and update_actor and itr >= critic_warmup_iters
+        post_probe_n = 0
+        post_probe_corr = float("nan")
+        post_probe_pos_delta = float("nan")
+        post_probe_neg_delta = float("nan")
+        post_probe_sign_agreement = float("nan")
+        post_probe_mean_delta = float("nan")
+        probe_inds = None
+        probe_logprobs_before = None
+        probe_advantages = None
+        probe_size = int(getattr(cfg.training, "post_update_probe_size", 256))
+        if actor_update_this_itr and probe_size > 0:
+            post_probe_n = min(probe_size, total_steps)
+            probe_inds = torch.randperm(total_steps, device=device)[:post_probe_n]
+            probe_batch_inds, probe_denoising_inds = torch.unravel_index(
+                probe_inds,
+                (n_steps * n_envs, denoising_steps),
+            )
+            probe_discount = gamma_denoising ** (denoising_steps - probe_denoising_inds - 1)
+            probe_advantages = (advantages_k[probe_batch_inds] * probe_discount).detach().clone()
+            probe_logprobs_before = old_logprobs_k[probe_inds].detach().clone()
+            logging.info(f"🧪 已固定 Post-update probe 样本: {post_probe_n}")
+
         bc_coef = float(getattr(cfg.training, "bc_loss_coef", 0.02))
         teacher_chains_flat = None
         if actor_update_this_itr and bc_coef > 0:
@@ -1156,6 +1339,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         running_pg_loss = []
         running_kl = []
         running_bc_loss = []
+        logprob_adv_stats = init_logprob_advantage_stats()
 
         # 2. 开始 Epoch 循环，PPO的数据集可以训练多轮，数据利用率高
         # PPO 的 old/new logprob 必须使用同一种观测预处理模式。
@@ -1175,7 +1359,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         actor.apply(freeze_bn)
         critic.apply(freeze_bn)
         early_stop = False
-        for epoch in tqdm(range(update_epochs), desc=f"⏳ PPO 更新中 (Iter {itr+1})", leave=False):
+        for epoch in tqdm(range(update_epochs), desc=f"  PPO 更新中 (Iter {itr+1})", leave=False):
             # 每一轮 Epoch 开始前检查，如果已熔断，彻底跳出 Epoch 循环，开启新的一轮迭代
             if early_stop:
                 break
@@ -1183,7 +1367,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             indices = torch.randperm(total_steps, device=device)
             num_batch = max(1, total_steps // batch_size) #分批次训练
 
-            for batch_idx in tqdm(range(num_batch), desc=f"   📦 Batch 更新", leave=False):
+            for batch_idx in tqdm(range(num_batch), desc=f"     Batch 更新", leave=False):
                 start = batch_idx * batch_size
                 end = start + batch_size
                 inds_b = indices[start:end] #从打乱的总数据中提取一个batch的索引
@@ -1225,7 +1409,6 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 # 去噪步骤的优势衰减折扣
                 # 越接近输出端 (denoising_inds_b 越大)，折扣越接近 1.0
                 # ==========================================
-                gamma_denoising = getattr(cfg.training, "gamma_denoising", 0.99)
                 # 将时刻t的优势值乘以折扣因子: gamma ** (ft_denoising_steps - i - 1)
                 discount = gamma_denoising ** (denoising_steps - denoising_inds_b - 1)
                 advantages_b = advantages_b * discount
@@ -1258,8 +1441,10 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                         )
 
                 # 2. PPO 概率比截断，Ratio = exp(new_logprob - old_logprob)
-                log_ratio = new_logprobs_b - old_logprobs_b
-                log_ratio = torch.clamp(log_ratio, min=-20.0, max=5.0)
+                raw_log_ratio = new_logprobs_b - old_logprobs_b
+                if actor_update_enabled:
+                    update_logprob_advantage_stats(logprob_adv_stats, raw_log_ratio, advantages_b)
+                log_ratio = torch.clamp(raw_log_ratio, min=-20.0, max=5.0)
                 ratio = torch.exp(log_ratio)
 
                 # 3. PPO 截断代理损失，把控单次更新范围
@@ -1319,7 +1504,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
 
                     # 🌟 修复 2：极其重要！必须手动销毁所有带梯度的局部变量，释放几 GB 的计算图！
                     try:
-                        del loss, pg_loss, v_loss, new_logprobs_b, log_ratio, ratio, surr1, surr2, values_pred
+                        del loss, pg_loss, v_loss, new_logprobs_b, raw_log_ratio, log_ratio, ratio, surr1, surr2, values_pred
                     except Exception:
                         pass
 
@@ -1353,6 +1538,54 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                     # 更新完后务必清空梯度！
                     actor_optimizer.zero_grad(set_to_none=True)
                     critic_optimizer.zero_grad(set_to_none=True)
+
+        # 固定样本 post-update probe：用同一批 rollout transition 比较更新前后的 logprob。
+        # 这比训练过程中的 minibatch 统计更直接，用来确认 actor 是否真的按 advantage 方向改变概率。
+        if probe_inds is not None and probe_logprobs_before is not None and probe_advantages is not None:
+            actor.eval()
+            probe_logprobs_after = torch.empty_like(probe_logprobs_before)
+            probe_batch_size = int(
+                getattr(cfg.training, "post_update_probe_batch_size", getattr(cfg.training, "batch_size", 32) * 2)
+            )
+            probe_batch_size = max(1, probe_batch_size)
+            with torch.no_grad():
+                for i in range(0, post_probe_n, probe_batch_size):
+                    end_i = min(i + probe_batch_size, post_probe_n)
+                    probe_inds_i = probe_inds[i:end_i]
+                    probe_batch_inds, probe_denoising_inds = torch.unravel_index(
+                        probe_inds_i,
+                        (n_steps * n_envs, denoising_steps),
+                    )
+                    b_inds_np = probe_batch_inds.cpu().numpy()
+                    d_inds_np = probe_denoising_inds.cpu().numpy()
+
+                    obs_probe = {}
+                    for k, v in obs_flat.items():
+                        tensor_v = torch.from_numpy(v[b_inds_np]).float().to(device)
+                        if "images" in k:
+                            tensor_v = tensor_v.permute(0, 1, 4, 2, 3) / 255.0
+                        obs_probe[k] = tensor_v
+
+                    chains_prev_probe = torch.from_numpy(chains_flat[b_inds_np, d_inds_np]).float().to(device)
+                    chains_next_probe = torch.from_numpy(chains_flat[b_inds_np, d_inds_np + 1]).float().to(device)
+                    probe_logprobs_after[i:end_i] = actor.get_logprobs(
+                        cond=obs_probe,
+                        x_t=chains_prev_probe,
+                        x_t_1=chains_next_probe,
+                        timesteps=recorded_timesteps[probe_denoising_inds],
+                        return_global_cond=False,
+                    )
+
+                    del obs_probe, chains_prev_probe, chains_next_probe
+
+            probe_delta = probe_logprobs_after - probe_logprobs_before
+            probe_stats = init_logprob_advantage_stats()
+            update_logprob_advantage_stats(probe_stats, probe_delta, probe_advantages)
+            post_probe_corr, post_probe_pos_delta, post_probe_neg_delta, post_probe_sign_agreement = (
+                finalize_logprob_advantage_stats(probe_stats)
+            )
+            post_probe_mean_delta = float(probe_delta.mean().item())
+            del probe_logprobs_after, probe_delta, probe_stats
         # 跑完一整轮环境交互 (Iteration)，让学习率步进一次
         if update_actor and itr >= critic_warmup_iters:
             actor_scheduler.step()
@@ -1364,10 +1597,12 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         # 🌟 修复 4：PPO 阶段结束，清扫全部巨大的训练经验张量，让显存归还给评估和下一次 Rollout
         # =========================================================
         try:
-            del loss, pg_loss, v_loss, new_logprobs_b, log_ratio, ratio, surr1, surr2, values_pred
+            del loss, pg_loss, v_loss, new_logprobs_b, raw_log_ratio, log_ratio, ratio, surr1, surr2, values_pred
 
             # 🌟 终极修复：把本轮所有的巨型 Buffer 全部粉碎！释放物理内存与文件读写锁！
             del chains_flat, obs_flat, chains_trajs, obs_trajs, returns_k, advantages_k, old_logprobs_k
+            if probe_inds is not None:
+                del probe_inds, probe_logprobs_before, probe_advantages
             if teacher_chains_flat is not None:
                 del teacher_chains_flat
             import gc
@@ -1391,15 +1626,36 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             avg_kl = np.mean(running_kl) if running_kl else 0.0
             max_kl = np.max(running_kl) if running_kl else 0.0
             avg_bc_loss = np.mean(running_bc_loss) if running_bc_loss else 0.0
-            logging.info(f"✅ 第 {itr+1} 轮完成！")
-            logging.info(f"   🏃 本轮共完成回合数: {len(completed_ep_rewards)}")
-            logging.info(f"   🎯 成功率: {success_rate * 100:.1f}%")
-            logging.info(f"   💰 平均回合总奖励 (Return): {avg_ep_return:.2f}")
-            logging.info(f"   🏆 最高回合奖励: {max_ep_return:.2f}")
+            logprob_adv_corr, pos_adv_logratio, neg_adv_logratio, adv_sign_agreement = (
+                finalize_logprob_advantage_stats(logprob_adv_stats)
+            )
+            logging.info(f"  第 {itr+1} 轮完成！")
+            logging.info(f"     本轮共完成回合数: {len(completed_ep_rewards)}")
+            logging.info(f"     成功率: {success_rate * 100:.1f}%")
+            logging.info(f"     平均回合总奖励 (Return): {avg_ep_return:.2f}")
+            logging.info(f"     最高回合奖励: {max_ep_return:.2f}")
             # 🌟 打印平均 Loss
-            logging.info(f"   📉 Critic (Value) Loss: {avg_v_loss:.4f}")
-            logging.info(f"   📉 Actor (Policy) Loss: {avg_pg_loss:.4f}")
-            logging.info(f"   📏 PPO KL: avg={avg_kl:.3e}, max={max_kl:.3e}, BC_NLL={avg_bc_loss:.5f}")
+            logging.info(f"     Critic (Value) Loss: {avg_v_loss:.4f}")
+            logging.info(f"     Actor (Policy) Loss: {avg_pg_loss:.4f}")
+            logging.info(f"     PPO KL: avg={avg_kl:.3e}, max={max_kl:.3e}, BC_NLL={avg_bc_loss:.5f}")
+            logging.info(
+                f"     Critic诊断: EV={critic_explained_variance:.4f}, "
+                f"Value/Return Corr={critic_value_return_corr:.4f}"
+            )
+            logging.info(
+                f"     PPO方向诊断: corr(Δlogp, Adv)={logprob_adv_corr:.4f}, "
+                f"Adv>0均值Δlogp={pos_adv_logratio:.3e}, "
+                f"Adv<0均值Δlogp={neg_adv_logratio:.3e}, "
+                f"符号一致率={adv_sign_agreement * 100:.1f}%"
+            )
+            logging.info(
+                f"     Post-update Probe: n={post_probe_n}, "
+                f"corr(Δlogp, Adv)={post_probe_corr:.4f}, "
+                f"均值Δlogp={post_probe_mean_delta:.3e}, "
+                f"Adv>0均值Δlogp={post_probe_pos_delta:.3e}, "
+                f"Adv<0均值Δlogp={post_probe_neg_delta:.3e}, "
+                f"符号一致率={post_probe_sign_agreement * 100:.1f}%"
+            )
 
             # 如果配置了 WandB
             # logger.log_dict({"train/avg_return": avg_ep_return}, step=itr)
@@ -1414,7 +1670,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
         is_last_step = (itr + 1) == cfg.training.n_train_itr
 
         if ((itr + 1) > critic_warmup_iters) and ((itr + 1) % eval_freq == 0 or is_last_step):
-            logging.info(f"\n🎬 开始第 {itr+1} 轮的策略评估与录像...")
+            logging.info(f"\n  开始第 {itr+1} 轮的策略评估与录像...")
 
             # 1. 设定本轮视频的保存路径
             tmp_videos_dir = Path(out_dir) / "eval" / f"videos_{itr+1:06d}"
@@ -1436,7 +1692,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
             # 3. 提取测试成绩
             sr = eval_info["aggregated"]["success_rate"]
             ar = eval_info["aggregated"]["average_reward"]
-            logging.info(f"📊 评估完成! 成功率: {sr*100:.1f}%, 平均奖励: {ar:.2f}")
+            logging.info(f"  评估完成! 成功率: {sr*100:.1f}%, 平均奖励: {ar:.2f}")
 
             if ar > best_eval_reward:
                 best_eval_reward = ar
@@ -1444,7 +1700,7 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 best_actor_state = snapshot_actor_state()
                 eval_collapse_count = 0
                 logging.info(
-                    f"🌟 刷新内存最佳Actor: success={best_eval_success_rate * 100:.1f}%, "
+                    f"  刷新内存最佳Actor: success={best_eval_success_rate * 100:.1f}%, "
                     f"reward={best_eval_reward:.2f}"
                 )
             else:
@@ -1452,18 +1708,19 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 rollback_sr = getattr(cfg.training, "rollback_success_rate", 0.1)
                 rollback_reward = getattr(cfg.training, "rollback_reward", -100.0)
                 rollback_patience = getattr(cfg.training, "rollback_patience", 1)
+                # 评估塌陷判定：成功率和奖励同时低于设定阈值，才算真正的塌陷，触发计数
                 eval_collapsed = sr <= rollback_sr and ar <= rollback_reward
                 if rollback_enabled and eval_collapsed:
                     eval_collapse_count += 1
                     logging.warning(
-                        f"🧯 评估已塌陷(success={sr * 100:.1f}%, reward={ar:.2f})，"
+                        f"  评估已塌陷(success={sr * 100:.1f}%, reward={ar:.2f})，"
                         f"计数 {eval_collapse_count}/{rollback_patience}。"
                     )
                     if eval_collapse_count >= rollback_patience:
                         restore_actor_state(best_actor_state)
                         eval_collapse_count = 0
                         logging.warning(
-                            f"✅ 已回滚到内存最佳Actor(success={best_eval_success_rate * 100:.1f}%, "
+                            f"  已回滚到内存最佳Actor(success={best_eval_success_rate * 100:.1f}%, "
                             f"reward={best_eval_reward:.2f})，并清空Actor optimizer状态。"
                         )
                         if tmp_videos_dir.exists():
@@ -1484,40 +1741,78 @@ def train_dppo_finetune(cfg: DictConfig, out_dir: str | None = None, job_name: s
                 import shutil
                 # 使用 shutil.move 比 Path.rename 更安全，能兼容跨盘操作
                 shutil.move(str(tmp_videos_dir), str(final_videos_dir))
-                logging.info(f"🎞️ 视频文件夹已重命名为: {final_videos_dir.name}")
+                logging.info(f"  视频文件夹已重命名为: {final_videos_dir.name}")
 
             actor.save_pretrained(save_path)
 
-            # 融合预训练底层网络配置与当前微调环境，生成完美的 config.yaml
-            save_path.mkdir(parents=True, exist_ok=True) # 确保目录已创建
+            # save_pretrained 写出的 config.json 是 LeRobot policy 专用配置；
+            # 这里额外重建完整 config.yaml，记录当前微调的训练/环境/eval 参数。
+            save_path.mkdir(parents=True, exist_ok=True)
             config_out_path = save_path / "config.yaml"
+            finetune_config_out_path = save_path / "finetune_config.yaml"
 
-            if hydra_cfg is not None:
-                # 1. 以包含完美网络结构的预训练配置为基础字典
-                final_config_dict = OmegaConf.to_container(hydra_cfg, resolve=True)
+            current_ft_dict = OmegaConf.to_container(cfg, resolve=True)
+            base_config_dict = OmegaConf.to_container(hydra_cfg, resolve=True) if hydra_cfg is not None else {}
 
-                # 2. 将当前微调使用的真实环境、评估参数以及 policy 微调字段覆盖进去
-                current_ft_dict = OmegaConf.to_container(cfg, resolve=True)
-                final_config_dict["env"] = current_ft_dict.get("env", final_config_dict.get("env"))
-                final_config_dict["eval"] = current_ft_dict.get("eval", final_config_dict.get("eval"))
+            # 1. 以预训练配置为底，保留完整 policy 网络结构；再递归覆盖当前微调配置。
+            final_config_dict = deep_update_dict(base_config_dict, current_ft_dict)
 
-                # 3. 融合 policy 节点（保留预训练结构的同时，加入微调可能新增的参数）
-                if "policy" in final_config_dict and "policy" in current_ft_dict:
-                    final_config_dict["policy"].update(current_ft_dict["policy"])
-            else:
-                # 容错降级方案
-                final_config_dict = OmegaConf.to_container(cfg, resolve=True)
+            # 2. training 节点必须使用当前微调配置，而不是预训练 offline training 配置。
+            if "training" in current_ft_dict:
+                final_config_dict["training"] = current_ft_dict["training"]
 
-            # 4. 正式写出文件
+            # 3. policy 节点用三方合并：预训练 YAML 结构 + save_pretrained 的 config.json + 当前微调 policy 覆盖。
+            saved_policy_json = {}
+            policy_json_path = save_path / "config.json"
+            if policy_json_path.exists():
+                with open(policy_json_path, "r", encoding="utf-8") as f:
+                    saved_policy_json = json.load(f)
+
+            runtime_policy_overrides = {
+                "ft_denoising_steps": int(getattr(actor.config, "ft_denoising_steps", getattr(cfg.policy, "ft_denoising_steps", 10))),
+                "n_action_steps": int(getattr(actor.config, "n_action_steps", getattr(cfg.policy, "n_action_steps", 8))),
+                "min_sampling_denoising_std": float(getattr(actor.config, "min_sampling_denoising_std", getattr(cfg.training, "min_sampling_denoising_std", 0.02))),
+                "min_logprob_denoising_std": float(getattr(actor.config, "min_logprob_denoising_std", getattr(cfg.training, "min_logprob_denoising_std", 0.02))),
+                "logprob_reduction": str(getattr(actor.config, "logprob_reduction", getattr(cfg.training, "logprob_reduction", "sum"))),
+            }
+            if hasattr(actor.config, "do_mask_loss_for_padding"):
+                runtime_policy_overrides["do_mask_loss_for_padding"] = bool(actor.config.do_mask_loss_for_padding)
+
+            final_policy = deep_update_dict(base_config_dict.get("policy", {}), saved_policy_json)
+            final_policy = deep_update_dict(final_policy, current_ft_dict.get("policy", {}))
+            final_policy = deep_update_dict(final_policy, runtime_policy_overrides)
+            final_config_dict["policy"] = final_policy
+
+            # 4. 记录 checkpoint 运行时指标，方便之后追溯这个快照来自哪一轮。
+            final_config_dict["checkpoint"] = {
+                "iteration": int(itr + 1),
+                "success_rate": float(sr),
+                "average_reward": float(ar),
+                "avg_policy_loss": float(avg_pg_loss),
+                "avg_value_loss": float(avg_v_loss),
+                "critic_explained_variance": float(critic_explained_variance),
+                "critic_value_return_correlation": float(critic_value_return_corr),
+                "logprob_advantage_correlation": float(logprob_adv_corr),
+                "positive_advantage_mean_logprob_delta": float(pos_adv_logratio),
+                "negative_advantage_mean_logprob_delta": float(neg_adv_logratio),
+                "logprob_advantage_sign_agreement": float(adv_sign_agreement),
+                "post_update_probe_size": int(post_probe_n),
+                "post_update_probe_logprob_delta_mean": float(post_probe_mean_delta),
+                "post_update_probe_logprob_advantage_correlation": float(post_probe_corr),
+                "post_update_probe_positive_advantage_mean_logprob_delta": float(post_probe_pos_delta),
+                "post_update_probe_negative_advantage_mean_logprob_delta": float(post_probe_neg_delta),
+                "post_update_probe_logprob_advantage_sign_agreement": float(post_probe_sign_agreement),
+                "rollout_success_rate": float(success_rate) if len(completed_ep_rewards) > 0 else None,
+                "rollout_average_return": float(avg_ep_return) if len(completed_ep_rewards) > 0 else None,
+            }
+
+            # 5. 写出完整混合配置和纯微调配置。config.json 保持 LeRobot 原生 policy 格式。
             with open(config_out_path, "w", encoding="utf-8") as f:
-                yaml.dump(
-                    final_config_dict,
-                    f,
-                    allow_unicode=True,
-                    sort_keys=False # 保持原始 yaml 顺序，方便阅读
-                )
+                yaml.dump(final_config_dict, f, allow_unicode=True, sort_keys=False)
+            with open(finetune_config_out_path, "w", encoding="utf-8") as f:
+                yaml.dump(current_ft_dict, f, allow_unicode=True, sort_keys=False)
 
-            logging.info(f"💾 模型快照及完美的混合 config.yaml 已完整保存至: {save_path}")
+            logging.info(f"  模型快照、完整 config.yaml 与 finetune_config.yaml 已保存至: {save_path}")
 
 
             # 5. 交给 TopKCheckpointManager 进行同步清理
@@ -1536,9 +1831,9 @@ if __name__ == "__main__":
     # 命令行参数注入
     default_args = [
         "policy=ft_zed_wrist_diffusion",
-        "training.pretrained_ckpt_path='outputs/1.hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion'",
-        "env.n_envs=5",
-        "training.rollout_steps=80",
+        "training.pretrained_ckpt_path='outputs/pretrain/train/2026-06-02/20-59-59_SewNeedle-3Arms-v0_collect_zed_wrist_diffusion/checkpoints/024000_loss=0.0113_sr=75.0_ar=498.56'",
+        "env.n_envs=1",
+        "training.rollout_steps=800",
         "training.batch_size=16",
         "training.update_epochs=1",
         "wandb.enable=false",

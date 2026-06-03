@@ -8,18 +8,36 @@ ENVS = {
     #  穿针任务 (3臂)
     # ==========================================
     "guided_vision/SewNeedle-3Arms-v0": {   
-        "entry_point": "env.sim_envs:SewNeedleEnv",  # 指向你的文件路径和类名
+        "entry_point": "env.task.sew_needle_env:SewNeedleEnv",  # 指向你的文件路径和类名
         "num_arms": 3,
         "episode_length": 300,
         "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
         "observation_height": 480,
         "observation_width": 640,
     },
+    # 穿针任务 (3臂) - 数据收集专用：成功标准更严格
+    "guided_vision/SewNeedle-3Arms-Collect-v0": {   
+        "entry_point": "env.task.sew_needle_env_collect_data:SewNeedleEnv",
+        "num_arms": 3,
+        "episode_length": 200,
+        "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
+        "observation_height": 480,
+        "observation_width": 640,
+    },
     # 穿针任务 (2臂)
     "guided_vision/SewNeedle-2Arms-v0": {
-        "entry_point": "env.sim_envs:SewNeedleEnv",
+        "entry_point": "env.task.sew_needle_env:SewNeedleEnv",
         "num_arms": 2,
         "episode_length": 300,
+        "cameras": ["overhead_cam", "worms_eye_cam", "wrist_cam_left", "wrist_cam_right"],
+        "observation_height": 480,
+        "observation_width": 640,
+    },
+    # 穿针任务 (2臂) - 数据收集专用：成功标准更严格
+    "guided_vision/SewNeedle-2Arms-Collect-v0": {
+        "entry_point": "env.task.sew_needle_env_collect_data:SewNeedleEnv",
+        "num_arms": 2,
+        "episode_length": 200,
         "cameras": ["overhead_cam", "worms_eye_cam", "wrist_cam_left", "wrist_cam_right"],
         "observation_height": 480,
         "observation_width": 640,
@@ -29,7 +47,7 @@ ENVS = {
     #  插槽插入任务 (3臂)
     # ==========================================
     "guided_vision/SlotInsertion-3Arms-v0": {   
-        "entry_point": "env.sim_envs:SlotInsertionEnv",  # 指向你的文件路径和类名
+        "entry_point": "env.task.sim_envs:SlotInsertionEnv",  # 指向你的文件路径和类名
         "num_arms": 3,
         "episode_length": 300,
         "cameras": ["zed_cam_left", "zed_cam_right", "wrist_cam_left", "wrist_cam_right", "overhead_cam", "worms_eye_cam"],
@@ -38,7 +56,7 @@ ENVS = {
     },
     # 💡 如果你有其他的任务（比如插孔），可以继续在这里添加：
     # "guided_vision/InsertPeg-3Arms-v0": {
-    #     "entry_point": "env.sim_envs:InsertPegEnv",
+    #     "entry_point": "env.task.sim_envs:InsertPegEnv",
     #     "num_arms": 3,
     #     "cameras": ["zed_cam_left", "zed_cam_right", "overhead_cam"],
     #     "observation_height": 480,

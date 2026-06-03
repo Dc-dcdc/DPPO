@@ -17,13 +17,14 @@ import imageio
 import json
 import shutil
 from pathlib import Path
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 import gymnasium as gym
 import yaml
 from tqdm import tqdm
 import random
 import time
 import sys
+import contextlib
 from types import SimpleNamespace
 from lerobot.common.policies.factory import make_policy
 from lerobot.common.utils.utils import get_safe_torch_device, init_logging
@@ -31,6 +32,86 @@ from lerobot.common.envs.utils import preprocess_observation
 import env.task.sim_envs
 # 确保能够导入你的环境
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from finetune.test_finetune import FrozenDiffusionMLPPolicy
+
+
+@contextlib.contextmanager
+def maybe_suppress_stdout(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    with open(os.devnull, "w", encoding="utf-8") as devnull:
+        with redirect_stdout(devnull):
+            yield
+
+
+def load_frozen_diffusion_mlp_policy(base_policy, load_dir: str | Path, device):
+    """Load the action MLP adapter saved by finetune/test_finetune.py."""
+    load_dir = Path(load_dir)
+    mlp_ckpt_path = load_dir / "action_mlp.pt"
+    mlp_config_path = load_dir / "action_mlp_config.json"
+
+    if not mlp_ckpt_path.exists():
+        raise FileNotFoundError(
+            f"找不到 action_mlp.pt: {mlp_ckpt_path}\n"
+            "请确认 ckpt_path 指向 DP+MLP 微调保存的 checkpoint 或其 pretrained_model 子目录。"
+        )
+
+    mlp_ckpt = torch.load(mlp_ckpt_path, map_location=device)
+    mlp_json = {}
+    if mlp_config_path.exists():
+        with open(mlp_config_path, "r", encoding="utf-8") as f:
+            mlp_json = json.load(f)
+
+    def pick(key, default):
+        if key in mlp_ckpt:
+            return mlp_ckpt[key]
+        return mlp_json.get(key, default)
+
+    action_dim = int(pick("action_dim", base_policy.config.output_shapes["action"][0]))
+    action_start = int(pick("action_start", getattr(base_policy.config, "n_obs_steps", 2) - 1))
+    action_end = int(
+        pick(
+            "action_end",
+            action_start + getattr(base_policy.config, "n_action_steps", base_policy.config.n_action_steps),
+        )
+    )
+    hidden_dim = int(pick("hidden_dim", 256))
+    depth = int(pick("depth", 2))
+    residual = bool(pick("residual", True))
+    residual_scale = float(pick("residual_scale", 1.0))
+    learn_std = bool(pick("learn_std", True))
+    logprob_reduction = str(pick("logprob_reduction", "sum"))
+
+    log_std = mlp_ckpt.get("log_std", torch.full((action_dim,), np.log(0.02), dtype=torch.float32))
+    init_std = float(log_std.float().exp().mean().item())
+
+    policy = FrozenDiffusionMLPPolicy(
+        base_policy=base_policy,
+        action_dim=action_dim,
+        action_start=action_start,
+        action_end=action_end,
+        hidden_dim=hidden_dim,
+        depth=depth,
+        residual=residual,
+        residual_scale=residual_scale,
+        init_std=init_std,
+        learn_std=learn_std,
+        logprob_reduction=logprob_reduction,
+    ).to(device)
+    policy.action_mlp.load_state_dict(mlp_ckpt["action_mlp"], strict=True) # 严格加载，确保权重完全匹配
+    with torch.no_grad():
+        policy.log_std.copy_(log_std.to(device))
+    policy.eval()
+
+    logging.info(
+        f"已加载 DP+MLP 微调模型: action_dim={action_dim}, action_slice=[{action_start}:{action_end}], "
+        f"hidden_dim={hidden_dim}, depth={depth}, residual={residual}, "
+        f"mean_action_std={float(policy.action_std.mean().detach().cpu().item()):.5f}"
+    )
+    return policy
+
 # ==========================================
 # 🌟 [新增] 自定义 Top-K 快照管理器(包含视频同步清理)
 # ==========================================
@@ -200,10 +281,20 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
     render_camera = raw_camera
     # 从配置中提取基础种子，默认为 1000
     base_seed = getattr(cfg_eval, "seed", 1000)
+    quiet = bool(getattr(cfg_eval, "quiet", True))
+    show_progress = bool(getattr(cfg_eval, "show_progress", not quiet))
+    suppress_model_stdout = bool(getattr(cfg_eval, "suppress_model_stdout", quiet))
     # 计算所有评估回合推理的总耗时
     global_real_inference_times = []
     # 动作执行循环
-    for ep in tqdm(range(n_episodes), leave=False):
+    episode_iter = tqdm(
+        range(n_episodes),
+        desc="Eval episodes",
+        leave=False,
+        dynamic_ncols=True,
+        disable=not show_progress,
+    )
+    for ep in episode_iter:
         # 计算当前回合的专属种子，并传给环境
         ep_seed = base_seed + ep
         # 先固定全局 RNG，再 reset 环境；这样 reset 内部若用 random/np/torch 也可复现。
@@ -256,7 +347,8 @@ def custom_eval_policy(env, policy, cfg_eval, videos_dir, device):
             # 3. 推理获取动作
             with torch.no_grad():
                 # 使用lerobot自带的推理函数，obs是单帧的，模型会自动处理历史动作的拼接和缓存
-                action = policy.select_action(obs) # 这里每次取出一个动作，推理依旧一次生成8个动作，只是一个个往外取
+                with maybe_suppress_stdout(suppress_model_stdout):
+                    action = policy.select_action(obs) # 这里每次取出一个动作，推理依旧一次生成8个动作，只是一个个往外取
             # 4. 把模型输出的 Tensor 动作转回 Numpy (包含在计时内)
             action_np = action.squeeze(0).cpu().numpy()
 
@@ -514,9 +606,13 @@ def main(eval_cfg):
             pretrained_policy_name_or_path=str(load_dir)
         )
         
-        logging.info("  成功使用 make_policy 加载策略！底层 Normalizer 与平滑权重已自动生效。")
-        # 手动推入 GPU
+        logging.info("  成功使用 make_policy 加载冻结 Diffusion 底座！底层 Normalizer 与平滑权重已自动生效。")
         policy.to(device)
+        policy = load_frozen_diffusion_mlp_policy(
+            base_policy=policy,
+            load_dir=load_dir,
+            device=device,
+        )
     except Exception as e:
         raise RuntimeError(f"❌ 权重加载失败！详细报错: {e}")
     
@@ -617,7 +713,7 @@ def main(eval_cfg):
     logging.info("="*50)
 
 # =========================================================================
-# 🌟 独立评估测试入口，推荐使用lerobot保存的快照格式，只需要给路径，环境配置会自动对齐
+# 🌟 独立评估测试入口，用于评估 test_finetune.py 保存的 DP+MLP checkpoint
 # =========================================================================
 if __name__ == "__main__":
 
@@ -631,8 +727,8 @@ if __name__ == "__main__":
     # ==========================================
     eval_cfg = SimpleNamespace(
         seed=100,
-        # 模型路径设置 (直接指向 0000600_loss=0.1540 文件夹即可，代码会自动寻找内部结构)
-        ckpt_path="outputs/finetune/train/2026-06-03/13-05-03_SewNeedle-3Arms-v0_ft_zed_wrist_diffusion/checkpoints/000034_sr=0.85_reward=584.92_Ploss=0.0014_Vloss=0.6356",
+        # 📂 模型路径设置：指向 checkpoint 文件夹即可，代码会自动寻找 pretrained_model/action_mlp.pt。
+        ckpt_path="outputs/finetune/train/2026-06-02/00-06-22_SewNeedle-2Arms-v0_ft_wrist_diffusion_mlp/checkpoints/000014_sr=0.75_reward=488.13_MLPloss=0.1031_Vloss=1.6439/pretrained_model",
         # ⚙️ 评估参数设置
         n_episodes=100,             # 评估多少个任务                 
         max_episodes_rendered=0,  # 保存多少个视频 
@@ -640,11 +736,15 @@ if __name__ == "__main__":
         max_steps=300,            # 每个任务的最大步数
         device="cuda",            # 如需完全规避 CUDA 非确定算子，可临时改成 "cpu"
         
-        # 相机设置
+        # 📷 相机设置
         # ['zed_cam_left', 'zed_cam_right', 'overhead_cam', 'worms_eye_cam' , 'wrist_cam_left', 'wrist_cam_right'],
         render_camera=['overhead_cam'],         # 保存video的相机视角    
         # ⚡ 混合精度设置 (推荐在评估时设为 False 以保证确定性)
         use_amp=False,          
+        # 🧹 终端显示设置：默认安静评估，只输出关键日志和最终结果。
+        quiet=True,
+        show_progress=False,
+        suppress_model_stdout=True,
     )
     ensure_python_hash_seed(eval_cfg.seed)
     # ==========================================print("cuda available:", torch.cuda.is_available())

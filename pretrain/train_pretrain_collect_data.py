@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 # ==========================================
 # 🌟 采用官方最新极简 API，抛弃 factory.py
 # ==========================================
+from lerobot.common.datasets.compute_stats import aggregate_stats
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.transforms import get_image_transforms
@@ -36,6 +37,82 @@ from lerobot.common.utils.utils import (
     init_logging,
     set_global_seed,
 )
+
+
+class CombinedLeRobotDataset(torch.utils.data.Dataset):
+    """把原始数据集和新采集数据集拼接起来，同时保留 LeRobotDataset 常用属性。"""
+
+    def __init__(self, datasets: list[LeRobotDataset], repo_ids: list[str]):
+        if len(datasets) < 2:
+            raise ValueError("CombinedLeRobotDataset 至少需要两个数据集。")
+        self._datasets = datasets
+        self.repo_ids = repo_ids
+        self.stats = aggregate_stats(datasets)
+
+        common_keys = set(datasets[0].features)
+        for dataset in datasets[1:]:
+            common_keys.intersection_update(dataset.features)
+        if not common_keys:
+            raise RuntimeError("多个数据集之间没有共同字段，无法合并训练。")
+
+        self.disabled_data_keys = set()
+        for dataset in datasets:
+            self.disabled_data_keys.update(set(dataset.features).difference(common_keys))
+
+        self.episode_data_index = self._build_episode_data_index()
+
+    def _build_episode_data_index(self) -> dict[str, torch.Tensor]:
+        from_indices = []
+        to_indices = []
+        sample_offset = 0
+        for dataset in self._datasets:
+            for start, end in zip(dataset.episode_data_index["from"], dataset.episode_data_index["to"], strict=True):
+                from_indices.append(start + sample_offset)
+                to_indices.append(end + sample_offset)
+            sample_offset += dataset.num_samples
+        return {
+            "from": torch.stack(from_indices),
+            "to": torch.stack(to_indices),
+        }
+
+    @property
+    def num_samples(self) -> int:
+        return sum(dataset.num_samples for dataset in self._datasets)
+
+    @property
+    def num_episodes(self) -> int:
+        return sum(dataset.num_episodes for dataset in self._datasets)
+
+    @property
+    def features(self):
+        return {
+            key: value
+            for key, value in self._datasets[0].features.items()
+            if key not in self.disabled_data_keys
+        }
+
+    @property
+    def fps(self) -> int:
+        return self._datasets[0].fps
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx: int):
+        if idx < 0 or idx >= len(self):
+            raise IndexError(f"Index {idx} out of bounds.")
+
+        start_idx = 0
+        for dataset_idx, dataset in enumerate(self._datasets):
+            if idx < start_idx + dataset.num_samples:
+                item = dataset[idx - start_idx]
+                for key in self.disabled_data_keys:
+                    item.pop(key, None)
+                item["dataset_index"] = torch.tensor(dataset_idx)
+                return item
+            start_idx += dataset.num_samples
+
+        raise IndexError(f"Index {idx} out of bounds.")
 
 
 
@@ -63,7 +140,7 @@ def make_optimizer_and_scheduler(cfg, policy):
         )
         lr_scheduler = None
     elif cfg.policy.name == "diffusion":
-        # 🌟 修复：分离视觉 Backbone 和 U-Net 的学习率，并将所有参数纳入优化器
+        # 修复：分离视觉 Backbone 和 U-Net 的学习率，并将所有参数纳入优化器
         optimizer_params_dicts = [
             {
                 "params": [
@@ -294,7 +371,7 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
     # 1. 获取配置
     delta_timestamps_cfg = cfg.training.get("delta_timestamps")
     
-    # 🚨 防御机制 1：如果整个节点都不存在，立刻终止！
+    # 防御机制 1：如果整个节点都不存在，立刻终止！
     if not delta_timestamps_cfg:
         raise ValueError("配置文件中缺失 `training.delta_timestamps` 参数！\n")
         
@@ -306,11 +383,11 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
         else:
             delta_timestamps_dict[key] = list(value)
             
-    # 🚨 防御机制 2：如果节点存在，但漏写了最重要的 `action`，立刻终止！
+    # 防御机制 2：如果节点存在，但漏写了最重要的 `action`，立刻终止！
     if "action" not in delta_timestamps_dict:
         raise ValueError("配置文件`delta_timestamps` 中缺失了最核心的 `action` 时间轴！\n")
         
-    # ⚠️ 软警告（可选）：Diffusion 通常还需要历史视觉帧，如果没写，可以给个黄字警告
+    # 软警告（可选）：Diffusion 通常还需要历史视觉帧，如果没写，可以给个黄字警告
     if cfg.policy.name == "diffusion" and not any("images" in k for k in delta_timestamps_dict.keys()):
         import logging
         logging.warning("警告: 你的 `delta_timestamps` 中没有包含任何图片的过去时间帧。\n")
@@ -319,11 +396,35 @@ def get_resolved_delta_timestamps(cfg: DictConfig) -> dict:
 
 
 
-# ✅ 这是一个完美且内存安全的 PyTorch 无限数据生成器
+# 这是一个完美且内存安全的 PyTorch 无限数据生成器
 def get_infinite_dataloader(dataloader):
     while True:
         for batch in dataloader:
             yield batch
+
+
+def clean_optional_repo_id(value) -> str:
+    repo_id = str(value or "").strip().strip("'\"")
+    if repo_id.lower() in {"", "none", "null"}:
+        return ""
+    return repo_id
+
+
+def restrict_dataset_image_columns(dataset: LeRobotDataset, image_keys: set[str], label: str) -> None:
+    """Drop unused camera columns before video decoding happens in LeRobotDataset.__getitem__."""
+    removable = [
+        key
+        for key in dataset.hf_dataset.column_names
+        if key.startswith("observation.images.") and key not in image_keys
+    ]
+    if not removable:
+        return
+
+    dataset.hf_dataset = dataset.hf_dataset.remove_columns(removable)
+    if isinstance(getattr(dataset, "stats", None), dict):
+        for key in removable:
+            dataset.stats.pop(key, None)
+    logging.info("%s 已裁剪未使用相机列，避免训练时额外解码: %s", label, removable)
 
 
 
@@ -346,9 +447,19 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_float32_matmul_precision('high')
     # ==========================================
-    # 🌟 1. 动态构建时间戳与挂载数据集
+    # 1. 动态构建时间戳与挂载数据集
     # ==========================================
-    logging.info("📦 正在挂载离线专家数据集...")
+    logging.info("正在挂载离线专家数据集...")
+    dataset_repo_id = clean_optional_repo_id(getattr(cfg, "dataset_repo_id", ""))
+    collect_dataset_repo_id = clean_optional_repo_id(getattr(cfg, "collect_dataset_repo_id", ""))
+    if not dataset_repo_id:
+        raise ValueError("配置中缺少 dataset_repo_id，请在配置文件中指定原始训练数据集。")
+    logging.info(f"原始训练数据集: {dataset_repo_id}")
+    if collect_dataset_repo_id:
+        logging.info(f"额外采集数据集: {collect_dataset_repo_id}")
+    else:
+        logging.info("额外采集数据集为空，仅使用原始数据集训练。")
+
     image_transforms = None
     # 色彩/像素级增强，对图像添加光亮色彩等随机扰动
     if cfg.training.image_transforms.enable:
@@ -369,49 +480,85 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         )
     # # 解析配置文件中的时间戳
     resolved_delta_timestamps = get_resolved_delta_timestamps(cfg)
-    logging.info(f"⏱️ 解析到的动作时间轴: {resolved_delta_timestamps.get('action', [])[:5]} ...")
-    logging.info(f"⏱️ 解析到的视觉时间轴: {resolved_delta_timestamps.get('observation.state', [])}")
+    logging.info(f"解析到的动作时间轴: {resolved_delta_timestamps.get('action', [])[:5]} ...")
+    logging.info(f"解析到的视觉时间轴: {resolved_delta_timestamps.get('observation.state', [])}")
+    policy_image_keys = {
+        key
+        for key in cfg.policy.input_shapes.keys()
+        if str(key).startswith("observation.images.")
+    }
 
 
-    offline_dataset = LeRobotDataset(
-        repo_id=cfg.dataset_repo_id, #根据id下载或者加载本地数据（/home/dc/.cache/huggingface/datasets）
+    base_dataset = LeRobotDataset(
+        repo_id=dataset_repo_id, #根据id下载或者加载本地数据（/home/dc/.cache/huggingface/datasets）
         delta_timestamps=resolved_delta_timestamps,
         video_backend=cfg.video_backend,
         image_transforms=image_transforms,
     )
+    restrict_dataset_image_columns(base_dataset, policy_image_keys, "原始数据集")
+    if collect_dataset_repo_id:
+        collect_dataset = LeRobotDataset(
+            repo_id=collect_dataset_repo_id,
+            delta_timestamps=resolved_delta_timestamps,
+            video_backend=cfg.video_backend,
+            image_transforms=image_transforms,
+        )
+        restrict_dataset_image_columns(collect_dataset, policy_image_keys, "采集数据集")
+        offline_dataset = CombinedLeRobotDataset(
+            datasets=[base_dataset, collect_dataset],
+            repo_ids=[dataset_repo_id, collect_dataset_repo_id],
+        )
+        logging.info(
+            "已合并数据集: 原始 %s (%d episodes, %d samples) + 采集 %s (%d episodes, %d samples) => %d episodes, %d samples",
+            dataset_repo_id,
+            base_dataset.num_episodes,
+            base_dataset.num_samples,
+            collect_dataset_repo_id,
+            collect_dataset.num_episodes,
+            collect_dataset.num_samples,
+            offline_dataset.num_episodes,
+            offline_dataset.num_samples,
+        )
+    else:
+        offline_dataset = base_dataset
     # # 使用官方函数解析并挂载到 cfg，这样 make_dataset 内部才能正确读取
     # resolve_delta_timestamps(cfg)
     
     # # 必须使用 make_dataset 以激活 ACT 依赖的 image_transforms
     # offline_dataset = make_dataset(cfg)
     # ==========================================
-    # 🌟 2. 断点续训：路径校验与防雷处理
+    # 2. 断点续训：路径校验与防雷处理
     # ==========================================
     start_step = 0
     policy_load_path = None
     training_state_file = None
+    resume_training_state = bool(getattr(cfg, "resume_training_state", True))
 
     if cfg.resume:
         # 将配置获取的内容强制转为字符串并小写，防范 "none", "null", NoneType 导致崩溃
         raw_path = str(getattr(cfg, "resume_path", "")).strip().lower()
         
         if raw_path in ["", "none", "null"]:
-            logging.warning("⚠️ 警告：开启了 resume=True，但 resume_path 为空，将从头开始全新训练。")
+            logging.warning("警告：开启了 resume=True，但 resume_path 为空，将从头开始全新训练。")
             cfg.resume = False # 强制关闭恢复标志
         else:
             chkpt_dir = Path(getattr(cfg, "resume_path"))
             if not chkpt_dir.exists():
-                logging.warning(f"⚠️ 警告：指定的恢复路径不存在 [{chkpt_dir}]，将从头开始全新训练。")
+                logging.warning(f"警告：指定的恢复路径不存在 [{chkpt_dir}]，将从头开始全新训练。")
                 cfg.resume = False # 强制关闭恢复标志
             else:
-                logging.info(f"🎯 成功检测到有效的恢复路径: {chkpt_dir}")
+                logging.info(f"成功检测到有效的恢复路径: {chkpt_dir}")
                 policy_load_path = chkpt_dir / "pretrained_model"
                 training_state_file = chkpt_dir / "training_state.pth"
+                if resume_training_state:
+                    logging.info("续训模式: 加载模型权重，并恢复 optimizer/scheduler/step 训练状态。")
+                else:
+                    logging.info("续训模式: 只加载模型权重，optimizer/scheduler/step 将重新开始。")
 
     # ==========================================
-    # 🌟 3. 初始化模型与优化器 (顺序极其重要！)
+    # 3. 初始化模型与优化器 (顺序极其重要！)
     # ==========================================
-    logging.info("🧠 正在初始化 Diffusion Policy...")
+    logging.info("正在初始化 Diffusion Policy...")
     
     # 3.1 先创建模型 (如果 cfg.resume 为 True，底层会自动从 policy_load_path 加载旧权重)
     policy = make_policy(
@@ -426,11 +573,11 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     grad_scaler = GradScaler(enabled=cfg.use_amp) # 用于自动计算梯度缩放因子
 
     # ==========================================
-    # 🌟 4. 恢复优化器与步数状态
+    # 4. 恢复优化器与步数状态
     # ==========================================
-    if cfg.resume and training_state_file and training_state_file.exists():
+    if cfg.resume and resume_training_state and training_state_file and training_state_file.exists():
         import json
-        logging.info("🔄 正在恢复优化器与训练步数...")
+        logging.info("正在恢复优化器与训练步数...")
         
         try:
             # 1. 一次性读取整个综合大字典，全部丢到内存(CPU)里准备分发
@@ -439,52 +586,54 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
             # 2. 恢复 Optimizer
             if "optimizer" in checkpoint_dict:
                 optimizer.load_state_dict(checkpoint_dict["optimizer"])
-                logging.info("✅ Optimizer (优化器) 状态已恢复")
+                logging.info("Optimizer (优化器) 状态已恢复")
             else:
-                logging.warning("⚠️ 存档中未找到 optimizer 状态，动量将重置！")
+                logging.warning("存档中未找到 optimizer 状态，动量将重置！")
 
             # 3. 恢复 LR Scheduler 
             # 兼容不同库的命名习惯（有时叫 lr_scheduler，有时叫 scheduler）
             if lr_scheduler is not None:
                 if "lr_scheduler" in checkpoint_dict:
                     lr_scheduler.load_state_dict(checkpoint_dict["lr_scheduler"])
-                    logging.info("✅ LR Scheduler (调度器) 状态已恢复")
+                    logging.info("LR Scheduler (调度器) 状态已恢复")
                 elif "scheduler" in checkpoint_dict:
                     lr_scheduler.load_state_dict(checkpoint_dict["scheduler"])
-                    logging.info("✅ LR Scheduler (调度器) 状态已恢复")
+                    logging.info("LR Scheduler (调度器) 状态已恢复")
                 else:
-                    logging.warning("⚠️ 存档中未找到 lr_scheduler 状态，学习率将重置！")
+                    logging.warning("存档中未找到 lr_scheduler 状态，学习率将重置！")
             # 4. 恢复 GradScaler (只有在使用混合精度时才需要)
             if cfg.use_amp and "grad_scaler" in checkpoint_dict:
                 grad_scaler.load_state_dict(checkpoint_dict["grad_scaler"])
-                logging.info("✅ GradScaler 状态已恢复")
+                logging.info("GradScaler 状态已恢复")
             else:
-                logging.warning("⚠️ 存档中未找到 grad_scaler 状态，梯度缩放因子将重置！")
+                logging.warning("存档中未找到 grad_scaler 状态，梯度缩放因子将重置！")
 
             # 5. 恢复 Step 步数
             if "step" in checkpoint_dict:
                 start_step = checkpoint_dict["step"] + 1
-                logging.info(f"⏭️ 从字典成功读取，训练将从 step {start_step} 无缝继续...")
+                logging.info(f"从字典成功读取，训练将从 step {start_step} 无缝继续...")
             else:
                 # 容错：如果字典里真没存步数，就退化为看文件夹的名字 (比如 000500)
                 # 提取下划线前的纯数字部分再转换
                 start_step = int(chkpt_dir.name.split('_')[0]) + 1
-                logging.info(f"⏭️ 字典中未记录步数，从目录名推断，训练将从 step {start_step} 无缝继续...")
+                logging.info(f"字典中未记录步数，从目录名推断，训练将从 step {start_step} 无缝继续...")
 
         except Exception as e:
-            logging.error(f"❌ 解析 {training_state_file.name} 失败: {e}")
+            logging.error(f"解析 {training_state_file.name} 失败: {e}")
             try:
                 # 提取下划线前的纯数字部分再转换
                 start_step = int(chkpt_dir.name.split('_')[0]) + 1
-                logging.info(f"⏭️ 降级方案：从目录名推断，训练将从 step {start_step} 无缝继续...")
+                logging.info(f"降级方案：从目录名推断，训练将从 step {start_step} 无缝继续...")
             except ValueError:
                 pass
+    elif cfg.resume and resume_training_state:
+        logging.warning(f"找不到状态文件 {training_state_file}，只能恢复模型权重，优化器将重新归零。")
     elif cfg.resume:
-        logging.warning(f"⚠️ 找不到状态文件 {training_state_file}，只能恢复模型权重，优化器将重新归零。")
+        logging.info("已按配置跳过训练状态恢复，将从 step 0 使用新优化器继续训练。")
 
 
     # ==========================================
-    # 🌟 5. 构建标准的高并发数据加载器 (彻底解耦)
+    # 5. 构建标准的高并发数据加载器 (彻底解耦)
     # ==========================================
     # 如果配置中指定了丢弃最后n帧数据，就使用EpisodeAwareSampler采样器，并且不进行shuffle，这样可以确保在每个训练周期内，模型不会看到每个episode的最后n帧数据，
     # 这对于某些任务可能有帮助，比如那些episode的最后几帧可能包含一些特殊的状态或者奖励信号，丢弃它们可以让模型更好地学习到一般性的行为模式。
@@ -499,31 +648,34 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
         shuffle = True
         sampler = None
 
-    dataloader = DataLoader(
-        offline_dataset,
-        num_workers=cfg.training.num_workers,
-        batch_size=cfg.training.batch_size,
-        shuffle=shuffle,         # 开启全局打乱
-        sampler=sampler,                   
-        pin_memory=(device.type != "cpu"),
-        drop_last=True, # 开启丢弃最后一个不完整的批次
-    )
+    dataloader_kwargs = {
+        "num_workers": cfg.training.num_workers,
+        "batch_size": cfg.training.batch_size,
+        "shuffle": shuffle,         # 开启全局打乱
+        "sampler": sampler,
+        "pin_memory": (device.type != "cpu"),
+        "drop_last": True, # 开启丢弃最后一个不完整的批次
+    }
+    if cfg.training.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = 4
+    dataloader = DataLoader(offline_dataset, **dataloader_kwargs)
     
     # 使用 Python 内置的 cycle 将其变为无限迭代器，使用 next(dl_iter) 进行取出一个batch的数据
     # dl_iter = cycle(dataloader) #会存有历史数据，导致显存溢出
     dl_iter = iter(get_infinite_dataloader(dataloader)) 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-    logging.info(f"📐 模型可学习参数量: {num_learnable_params} ({format_big_number(num_learnable_params)})")
-    logging.info(f"🎯 预训练目标步数: {cfg.training.offline_steps}")
+    logging.info(f"模型可学习参数量: {num_learnable_params} ({format_big_number(num_learnable_params)})")
+    logging.info(f"预训练目标步数: {cfg.training.offline_steps}")
 
     # ==========================================
-    # 🌟 5. 动态拼接环境 ID 并创建环境
+    # 5. 动态拼接环境 ID 并创建环境
     # ==========================================
     # 观测要用的相机列表  =  模型推理要用的相机列表 + 评估时保存的video视角相机
     all_obs_keys = policy.config.input_shapes.keys()
     ref_cams = [k.replace("observation.images.", "") for k in all_obs_keys if "observation.images." in k]
     if not ref_cams:
-        raise ValueError(f"❌ 严重冲突：模型中未找到相机相关参数。请检查模型输入是否正确。")
+        raise ValueError(f"严重冲突：模型中未找到相机相关参数。请检查模型输入是否正确。")
     obs_cameras = list(dict.fromkeys(ref_cams + cfg.eval.render_camera))
 
     # 读取 YAML 中的 name ("guided_vision") 和 task ("SewNeedle-2Arms-v0")
@@ -541,7 +693,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
     logging.info(f"✅ 环境加载成功！最终挂载的相机: {obs_cameras}")
 
     # ==========================================
-    # 🌟 6. DPPO 预训练主循环
+    # 6. DPPO 预训练主循环
     # ==========================================
     max_checkpoints = getattr(cfg.eval, "max_checkpoints", 5)
     records_resume = getattr(cfg.eval, "records_resume", True)
@@ -551,7 +703,7 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
                                     records_resume=records_resume, 
                                     metric=checkpoint_metric)
     policy.train()
-    logging.info("🔥 开始 DPPO 预训练 (模仿学习阶段)...")
+    logging.info("开始 DPPO 预训练 (模仿学习阶段)...")
     
     # 从 start_step 开始，避免覆盖之前的进度！
     for step in range(start_step, cfg.training.offline_steps):
@@ -597,10 +749,10 @@ def train_dppo_pretrain(cfg: DictConfig, out_dir: str | None = None, job_name: s
             train_loss=train_info["loss"],
             manager=manager,
         )
-    logging.info("🎉 DPPO 预训练圆满结束！你现在可以拿着这个 Checkpoint 去跑 PPO 微调了。")
+    logging.info("DPPO 预训练圆满结束！你现在可以拿着这个 Checkpoint 去跑 PPO 微调了。")
 
 # ==========================================
-# 🌟 Hydra 启动入口 (保留配置功能与 Args 注入)
+# Hydra 启动入口 (保留配置功能与 Args 注入)
 # ==========================================
 @hydra.main(version_base="1.2", config_name="pre_default", config_path="../configs/pretrain") #配置文件存放位置
 def train_cli(cfg: DictConfig):
@@ -612,31 +764,39 @@ def train_cli(cfg: DictConfig):
     )
 
 if __name__ == "__main__":
+
     # 强行注入命令行参数 (极大提升本地调试和修改效率)
-    # 这里面也可以随时添加你想覆盖的 args 参数
+    # 命令行手动传入同名参数时，会优先生效。
     default_args = [
-        "env=sim_sew_needle_3arms", # 环境，这俩定义在default文件中
-        "policy=pre_zed_wrist_diffusion", # 策略
-        "resume=false",
-        "resume_path='outputs/pretrain/train/2026-05-19/00-57-05_SewNeedle-3Arms-v0_pre_zed_static_wrist_diffusion/checkpoints/108000_loss=0.0111_sr=0.0_ar=-64.33'",
-        "training.batch_size=16",
-        "training.num_workers=4",
-        "wandb.enable=false", # 关闭 wandb，不需要aLse" ,
+        f"env=sim_sew_needle_3arms",
+        f"policy=collect_zed_wrist_diffusion",
+        # 额外采集数据集；留空只使用 env 配置中的原始 dataset_repo_id。
+        # 如果要加入新采集数据，就改成: f"+collect_dataset_repo_id=Dc-dc/collect_sim_sew_needle_3arms"
+        f"+collect_dataset_repo_id='Dc-dc/collect_sim_sew_needle_3arms'",
+        f"resume=True",
+        f"resume_path='outputs/1_hugging_model/pre_sim_sew_needle_3arms_zed_wrist_diffusion'",
+        f"+resume_training_state=False",  #是否恢复训练状态（优化器、调度器、步数等），false仅加载模型权重
+        f"training.batch_size=16",
+        f"training.num_workers=4",
+        f"wandb.enable=False",
     ]
-    
     for arg in default_args:
-        arg_key = arg.split("=")[0]
-        if not any(arg_key in sys_arg for sys_arg in sys.argv):
+        arg_key = arg.split("=", 1)[0].lstrip("+")
+        if not any(sys_arg.split("=", 1)[0].lstrip("+") == arg_key for sys_arg in sys.argv):
             sys.argv.append(arg)
 
     # ==========================================
-    # 🌟 核心修复：在 Hydra 启动前截胡！强行修改底层输出目录
+    # 核心修复：在 Hydra 启动前截胡！强行修改底层输出目录
     # ==========================================
     # 使用 replace(" ", "") 过滤掉所有可能的空格干扰
     is_resume = any(arg.lower().replace(" ", "") == "resume=true" for arg in sys.argv)
+    should_resume_training_state = any(
+        arg.lower().replace(" ", "").lstrip("+") == "resume_training_state=true"
+        for arg in sys.argv
+    )
     resume_path_arg = next((arg for arg in sys.argv if arg.startswith("resume_path=")), None)
 
-    if is_resume and resume_path_arg:
+    if is_resume and should_resume_training_state and resume_path_arg:
         resume_path = resume_path_arg.split("=", 1)[1].strip("'\"")
         
         # 只要路径有效，就强行重定向
@@ -647,6 +807,6 @@ if __name__ == "__main__":
             
             # 告诉 Hydra：不要建新文件夹了，日志、配置、视频统统给我存进这个老目录！
             sys.argv.append(f'hydra.run.dir="{original_out_dir}"')
-            print(f"🔄 [预处理] 检测到断点续训，已强制重定向所有输出至旧目录:\n   👉 {original_out_dir}")
+            print(f"[预处理] 检测到断点续训，已强制重定向所有输出至旧目录:\n   👉 {original_out_dir}")
     
     train_cli()

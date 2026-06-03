@@ -20,12 +20,14 @@ training:
   pretrained_ckpt_path: "outputs/pretrain/train/.../checkpoints/050000"
   min_sampling_denoising_std: 0.02  # DDIM采样探索标准差；视觉机器人任务建议保持小而非0
   min_logprob_denoising_std: 0.02   # 与采样标准差保持一致，避免old/new logprob尺度不匹配
+  logprob_reduction: sum            # PPO使用联合动作块logprob；mean会把梯度按8*21维稀释
   reward_ema_alpha: 0.05            # 滑动更新全局奖励方差
-  target_kl: 0.02                   # PPO早停阈值；只在critic warmup之后生效
-  bc_loss_coef: 0.005               # teacher-action NLL正则；过大会把actor锁死在预训练附近
+  target_kl: 0.03                   # PPO早停阈值；只在critic warmup之后生效
+  bc_loss_coef: 0.0002               # BC 正则/teacher 约束
   lr_backbone: 1e-5
   use_disk_cache: True   # True 开启硬盘缓存 (省内存), False 开启纯内存模式 (速度最快)
   grad_accumulate: 4     # 梯度累计步数
+  post_update_probe_size: 256  # 固定一批样本，诊断actor更新后是否按advantage方向改变logprob
   actor_lr_warmup_iters: 5
   rollout_policy: dppo   # dppo: DPPO采样；select_action: 复用eval推理，只做排查
   skip_update: false     # true时只采集rollout，不更新Actor/Critic
@@ -37,12 +39,13 @@ training:
   rollback_success_rate: 0.1
   rollback_reward: -100.0
   rollback_patience: 1
-
+  ema_alpha: 0.01  # EMA更新全局奖励方差的平滑系数
 
 eval:
+  seed: 100            # 评估时的随机种子
   checkpoint_metric: "reward" # 筛选指标：可选 'loss' 或 'reward'
-  max_checkpoints: 10  # 最多保存loss最小的几个模型快照
-  n_episodes: 10             # 每次评估跑多少个完整的 episode
+  max_checkpoints: 20  # 最多保存loss最小的几个模型快照
+  n_episodes: 20             # 每次评估跑多少个完整的 episode
   max_episodes_rendered: 1   # 最多保存前几个 episode 的录像视频
   records_resume: True  # 是否读取top-k的快照和视频列表 即top_k_records.json
   fps: 25                    # 录制的 MP4 视频帧率
