@@ -1,7 +1,7 @@
 # @package _global_
 # 冻结预训练 Diffusion，只训练最终动作后处理 MLP 的调试配置。
 # 可用命令查看最终合并结果:
-# python finetune/test_finetune.py --cfg job
+# python train/finetune/test_finetune.py --cfg job
 
 seed: 1000
 dataset_repo_id: "dppo_online_rollout"

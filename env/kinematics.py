@@ -1,7 +1,7 @@
 
 import numpy as np
 import mujoco
-from transform_utils import exp2mat, adjoint, within_pose_threshold, pose2mat, wxyz_to_xyzw
+from data_collect.transform_utils import exp2mat, adjoint, within_pose_threshold, pose2mat, wxyz_to_xyzw
 from numba import jit, prange
 
 # 基于PoE的正运动学，比自带的mujoco.mj_kinematics更快，且可以直接输出位姿矩阵，方便后续计算雅可比矩阵和差分逆运动学
@@ -147,7 +147,7 @@ def create_safety_fn(
 if __name__ == "__main__":
     from constants import XML_DIR, LEFT_JOINT_NAMES, LEFT_ACTUATOR_NAMES, LEFT_EEF_SITE
     from dm_control import mjcf
-    from transform_utils import mat2quat
+    from data_collect.transform_utils import mat2quat
     import os
 
     np.set_printoptions(formatter={'float': lambda x: "{0:0.3f}".format(x)})

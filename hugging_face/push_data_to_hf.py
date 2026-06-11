@@ -615,8 +615,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--raw-dir",
-        default="outputs/data_collect/collect_SewNeedle-3Arms-v0_3Arms_2026-06-02_11-52-01",
-        help="采集数据目录；也可以填 outputs/data_collect，脚本会自动选择最新的 collect_* 目录。",
+        default="outputs/4_data_collect/collect_SewNeedle-3Arms-v0_3Arms_2026-06-02_11-52-01",
+        help="采集数据目录；也可以填 outputs/4_data_collect，脚本会自动选择最新的 collect_* 目录。",
     )
     parser.add_argument(
         "--repo-id",
@@ -805,8 +805,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # collect_data.py 采集数据目录；也可以填 outputs/data_collect 自动选择最新 collect_*。
-    RAW_DIR = "outputs/data_collect/collect_SewNeedle-3Arms-v0_3Arms_2026-06-02_15-01-25"
+    # collect_data.py 采集数据目录；也可以填 outputs/4_data_collect 自动选择最新 collect_*。
+    RAW_DIR = "outputs/4_data_collect/collect_SewNeedle-3Arms-v0_3Arms_2026-06-02_15-01-25"
 
     # Hugging Face 数据集仓库，格式必须是 用户名/数据集名。
     HF_REPO_ID = "Dc-dc/collect_sim_sew_needle_3arms"

@@ -1,5 +1,5 @@
 import numpy as np
-from transform_utils import angular_error, wxyz_to_xyzw, quat2mat
+from data_collect.transform_utils import angular_error, wxyz_to_xyzw, quat2mat
 from kinematics import create_fk_fn, create_safety_fn, create_jac_fn
 from numba import jit
 import mujoco
@@ -110,7 +110,7 @@ if __name__ == '__main__':
     import mujoco.viewer
     import time
     import os
-    from transform_utils import mat2quat, xyzw_to_wxyz
+    from data_collect.transform_utils import mat2quat, xyzw_to_wxyz
     import cv2
     import pygame #手柄库
     MOCAP_NAME = "target"

@@ -6,7 +6,7 @@
         "limitSymbolsToIncludedHeaders": false
       },
       "includePath": [
-        "/home/dc/视点寻优+遥操/interbotix_ws/devel/include/**",
+        "/home/dc/Active vision/interbotix_ws/devel/include/**",
         "/opt/ros/noetic/include/**",
         "/usr/include/**"
       ],

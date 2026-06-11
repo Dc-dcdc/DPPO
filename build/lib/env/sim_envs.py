@@ -616,7 +616,7 @@ if __name__ == '__main__':
     # ==========================================
     # 🎯 1. 设置权重路径与加载
     # ==========================================
-    ckpt_path = "outputs/pretrain/train/2026-05-13/23-21-10_SewNeedle-3Arms-v0_pre_zed_wrist_diffusion/checkpoints/110000_loss=0.0040_sr=90.0_ar=700.61"
+    ckpt_path = "outputs/2_pretrain/train/2026-05-13/23-21-10_SewNeedle-3Arms-v0_pre_zed_wrist_diffusion/checkpoints/110000_loss=0.0040_sr=90.0_ar=700.61"
     
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"⚠️ 找不到权重路径: {ckpt_path}\n请修改为正确的 ckpt_path。")

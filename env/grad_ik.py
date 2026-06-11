@@ -2,7 +2,7 @@ import numpy as np
 import numpy as np
 from numba import jit, prange
 from kinematics import create_fk_fn
-from transform_utils import wxyz_to_xyzw, quat2mat, angular_error, within_pose_threshold, limit_pose
+from data_collect.transform_utils import wxyz_to_xyzw, quat2mat, angular_error, within_pose_threshold, limit_pose
 
 
 @jit(nopython=True, fastmath=True, cache=False)
@@ -231,7 +231,7 @@ if __name__ == '__main__':
     import mujoco.viewer
     import time
     import os
-    from transform_utils import mat2quat, xyzw_to_wxyz
+    from data_collect.transform_utils import mat2quat, xyzw_to_wxyz
 
     MOCAP_NAME = "target"
     PHYSICS_DT=0.002

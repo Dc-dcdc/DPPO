@@ -3,3 +3,11 @@ src/
 datasets/
 __pycache__/
 *.pyc
+
+# Unity 生成内容
+data_collect/meta\ quest3/Library/
+data_collect/meta\ quest3/Temp/
+data_collect/meta\ quest3/Logs/
+data_collect/meta\ quest3/UserSettings/
+data_collect/meta\ quest3/*.csproj
+data_collect/meta\ quest3/*.sln

@@ -196,40 +196,46 @@ def make_stereo_matcher(cfg: RunPolicySimConfig):
     block_size = max(3, block_size)
 
     return cv2.StereoSGBM_create(
-        minDisparity=0,
-        numDisparities=num_disparities,
-        blockSize=block_size,
-        P1=8 * 3 * block_size * block_size,
-        P2=32 * 3 * block_size * block_size,
-        disp12MaxDiff=1,
-        uniquenessRatio=8,
-        speckleWindowSize=80,
-        speckleRange=2,
-        preFilterCap=63,
-        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
+        minDisparity=0,                       # 最小视差，通常设为0，表示不允许负视差（即右图像中的点不能比左图像更靠右）
+        numDisparities=num_disparities,       # 视差数量，必须是16的倍数，增加可以提升远距离深度分辨率但会增加计算量
+        blockSize=block_size,                 # 匹配块大小，必须是奇数，较小的值可以保留更多细节但可能更噪声，较大的值会更平滑但可能丢失边缘信息
+        P1=8 * 3 * block_size * block_size,   # 惩罚视差变化较小的像素块，通常设为8*通道数*blockSize^2
+        P2=32 * 3 * block_size * block_size,  # 惩罚视差变化较大的像素块，通常设为32*通道数*blockSize^2，P2应该大于P1
+        disp12MaxDiff=1,                      # 左右视差图的一致性检查，允许的最大差异，设为1可以过滤掉一些错误匹配
+        uniquenessRatio=8,                    # 视差唯一性百分比，较高的值可以减少错误匹配，但可能丢失一些正确匹配，通常设为5-15
+        speckleWindowSize=80,                 # 视差连通区域的最大尺寸，较小的值可以过滤掉更多噪声，但可能丢失一些小物体，通常设为50-200
+        speckleRange=2,                       # 视差连通区域内允许的最大视差变化，较小的值可以过滤掉更多噪声，但可能丢失一些正确匹配，通常设为1-2
+        preFilterCap=63,                      # 预滤波器的截断值，较高的值可以保留更多细节，但可能更噪声，通常设为31-63
+        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,  # 使用 SGBM 的三路算法，可以获得更好的匹配质量，但计算更慢，适合离线处理或性能较好的环境
     )
 
 
+# 从左右相机图像计算深度图，并将深度图转换为可视化的 BGR 图像，同时在中心区域显示当前的深度值和有效像素比例。
 def estimate_zed_stereo_depth(left_rgb, right_rgb, stereo_matcher, focal_px: float, baseline_m: float):
     left_gray = cv2.cvtColor(left_rgb, cv2.COLOR_RGB2GRAY)
     right_gray = cv2.cvtColor(right_rgb, cv2.COLOR_RGB2GRAY)
+
+    # 计算视差：disparity = x_left - x_right，单位是像素。
+    # 同一个三维点在左图和右图中的横向像素差越大，说明它离相机越近；视差越小，说明它越远。
     disparity_px = stereo_matcher.compute(left_gray, right_gray).astype(np.float32) / 16.0
 
     depth_m = np.full(disparity_px.shape, np.nan, dtype=np.float32)
-    valid = disparity_px > 0.1
-    depth_m[valid] = (float(focal_px) * float(baseline_m)) / disparity_px[valid]
-    return depth_m, disparity_px
+    valid = disparity_px > 0.1 # 过滤掉视差过小的像素，避免除零或过大深度值
 
+    # 根据双目立体视觉的基本原理，深度 = (焦距 * 基线) / 视差  
+    depth_m[valid] = (float(focal_px) * float(baseline_m)) / disparity_px[valid]  # Z = fx * B / d
+    return depth_m, disparity_px  # 返回深度图和视差图
 
+# 将深度图转换为可视化的 BGR 图像，同时返回一个有效像素的布尔掩码，用于后续统计和显示。
 def depth_to_bgr(depth_m: np.ndarray, cfg: RunPolicySimConfig):
-    valid = np.isfinite(depth_m) & (depth_m > 0.0)
-    clipped = np.clip(depth_m, cfg.depth_min_m, cfg.depth_max_m)
-    normalized = (clipped - cfg.depth_min_m) / max(cfg.depth_max_m - cfg.depth_min_m, 1e-6)
-    normalized = np.nan_to_num(normalized, nan=1.0, posinf=1.0, neginf=1.0)
-    heat = ((1.0 - normalized) * 255.0).astype(np.uint8)
-    colormap = getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET)
-    depth_bgr = cv2.applyColorMap(heat, colormap)
-    depth_bgr[~valid] = 0
+    valid = np.isfinite(depth_m) & (depth_m > 0.0)                # 只有有限且正的深度值才是有效的
+    clipped = np.clip(depth_m, cfg.depth_min_m, cfg.depth_max_m)  # 将深度值限制在指定范围内，避免极端值影响可视化效果
+    normalized = (clipped - cfg.depth_min_m) / max(cfg.depth_max_m - cfg.depth_min_m, 1e-6) # 归一化到 [0, 1] 范围，depth_min_m 映射为 0，depth_max_m 映射为 1
+    normalized = np.nan_to_num(normalized, nan=1.0, posinf=1.0, neginf=1.0)  # 将无效值（NaN、正无穷、负无穷）替换为 1.0，这样它们在可视化中会显示为最远的颜色（通常是黑色或深蓝色），而不是引入异常的颜色。
+    heat = ((1.0 - normalized) * 255.0).astype(np.uint8)          # 将归一化深度映射到 0~255 的整数灰度
+    colormap = getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET)   
+    depth_bgr = cv2.applyColorMap(heat, colormap)                 # 将灰度图变成 BGR 彩色图 
+    depth_bgr[~valid] = 0                                         # 将无效像素的颜色设置为黑色（0, 0, 0），以便在显示时区分有效和无效区域
     return depth_bgr, valid
 
 
@@ -241,6 +247,7 @@ def make_zed_depth_panel(
     focal_px: float,
     baseline_m: float,
 ):
+    # 计算 ZED 双目立体深度图和视差图
     depth_m, disparity_px = estimate_zed_stereo_depth(
         left_rgb,
         right_rgb,
@@ -248,21 +255,23 @@ def make_zed_depth_panel(
         focal_px=focal_px,
         baseline_m=baseline_m,
     )
-    depth_bgr, valid = depth_to_bgr(depth_m, cfg)
+
+    # 将深度图转换为可视化的 BGR 图像，同时返回一个有效像素的布尔掩码，用于后续统计和显示。
+    depth_bgr, valid = depth_to_bgr(depth_m, cfg) 
 
     h, w = depth_m.shape[:2]
-    cx, cy = w // 2, h // 2
-    patch = depth_m[max(0, cy - 4):min(h, cy + 5), max(0, cx - 4):min(w, cx + 5)]
-    patch = patch[np.isfinite(patch) & (patch > 0.0)]
-    center_depth = float(np.median(patch)) if patch.size else float("nan")
-    valid_ratio = float(np.mean(valid)) if valid.size else 0.0
+    cx, cy = w // 2, h // 2   # 获取中心点坐标
+    patch = depth_m[max(0, cy - 4):min(h, cy + 5), max(0, cx - 4):min(w, cx + 5)] # 提取中心 9x9 区域的深度值，用于计算中心深度和有效像素比例
+    patch = patch[np.isfinite(patch) & (patch > 0.0)]                             # 过滤掉无效的深度值（非有限值或非正值），只保留有效的深度值用于统计
+    center_depth = float(np.median(patch)) if patch.size else float("nan")        # 计计算中心区域深度的中值，可以减少噪声的影响，如果没有有效像素则返回 NaN
+    valid_ratio = float(np.mean(valid)) if valid.size else 0.0                    # 计算整个深度图中有效像素的比例，作为当前视差计算质量的一个指标
 
     cv2.line(depth_bgr, (cx - 12, cy), (cx + 12, cy), (255, 255, 255), 2)
     cv2.line(depth_bgr, (cx, cy - 12), (cx, cy + 12), (255, 255, 255), 2)
     cv2.putText(depth_bgr, "zed_stereo_depth", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
     cv2.putText(
-        depth_bgr,
-        f"center: {center_depth:.3f} m | valid: {valid_ratio * 100:.1f}%",
+        depth_bgr, 
+        f"center: {center_depth:.3f} m | valid: {valid_ratio * 100:.1f}%",# 在深度图上显示中心点深度和有效像素百分比
         (10, 62),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -315,16 +324,18 @@ def render_monitor_frame(
     state: ControlState,
     steps: int,
     episode_reward: float,
-    stereo_matcher,
-    zed_focal_px: float,
-    zed_baseline_m: float,
+    stereo_matcher,          # OpenCV 立体匹配器实例，用于计算 ZED 深度图
+    zed_focal_px: float,     # ZED 相机的焦距（单位：像素），用于将视差转换为深度，通过相机参数计算得到
+    zed_baseline_m: float,   # ZED 相机的基线距离（单位：米），用于将视差转换为深度，通过相机参数计算得到
 ) -> np.ndarray:
-    frames_bgr = []
-    rgb_cache = {}
+    frames_bgr = []          # 保存每个相机渲染后的 BGR 图像
+    rgb_cache = {}           # 用于缓存已经渲染过的相机图像
 
     for camera in cfg.display_cameras:
+        # 渲染指定相机的 RGB 图像，返回 (H,W,3)
         rgb = render_camera_rgb(sim_env, camera, cfg)
         rgb_cache[camera] = rgb
+        # 将 RGB 图像转换为 BGR 并添加标签后保存到 frames_bgr 列表中
         frames_bgr.append(label_frame(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), camera))
 
     if cfg.show_zed_depth:
@@ -345,12 +356,14 @@ def render_monitor_frame(
         )
         frames_bgr.append(zed_depth_bgr)
 
+    # 根据指定列数把多张图像拼接成网格
     combined = build_image_grid(frames_bgr, cfg.max_grid_cols)
     h, w = combined.shape[:2]
+    # 左下角显示当前步数和累计奖励
     cv2.putText(
         combined,
         f"Step: {steps} | Reward: {episode_reward:.2f}",
-        (20, h - 30),
+        (800, h - 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         1,
         (255, 255, 0),
@@ -528,9 +541,9 @@ if __name__ == "__main__":
         ),
         show_mujoco_viewer=True,    # 是否显示 Mujoco 自带的 3D 视角，设为 True 可在其中查看物理仿真状态并通过空格键重置环境。
         show_zed_depth=True,        # 是否计算并显示 ZED 立体深度图，设为 True 需要正确配置 zed_left_camera 和 zed_right_camera。
-        depth_min_m=0.05,           # ZED 深度图的最小显示距离（单位：米），小于此距离的部分会被裁剪掉以减少噪声影响。
+        depth_min_m=0.001,           # ZED 深度图的最小显示距离（单位：米），小于此距离的部分会被裁剪掉以减少噪声影响。
         depth_max_m=0.60,           # ZED 深度图的最大显示距离（单位：米），大于此距离的部分会被裁剪掉以突出近距离物体。
         stereo_num_disparities=256, # 立体匹配器的视差数量，必须是 16 的倍数，增加可以提升远距离深度分辨率但会增加计算量。
-        stereo_block_size=5,        # 立体匹配器的块大小，必须是奇数，较小的值可以保留更多细节但可能更噪声，较大的值会更平滑但可能丢失边缘信息。
+        stereo_block_size=3,        # 立体匹配器的块大小，必须是奇数，较小的值可以保留更多细节但可能更噪声，较大的值会更平滑但可能丢失边缘信息。
     )
     run(CONFIG)

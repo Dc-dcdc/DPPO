@@ -1,11 +1,11 @@
 {
     "python.autoComplete.extraPaths": [
-        "/home/dc/视点寻优+遥操/interbotix_ws/devel/lib/python3/dist-packages",
+        "/home/dc/Active vision/interbotix_ws/devel/lib/python3/dist-packages",
         "/opt/ros/noetic/lib/python3/dist-packages",
         "/home/dc/diffusion_policy/diffusion_policy/env/kitchen/relay_policy_learning/adept_envs"
     ],
     "python.analysis.extraPaths": [
-        "/home/dc/视点寻优+遥操/interbotix_ws/devel/lib/python3/dist-packages",
+        "/home/dc/Active vision/interbotix_ws/devel/lib/python3/dist-packages",
         "/opt/ros/noetic/lib/python3/dist-packages",
         "/home/dc/diffusion_policy/diffusion_policy/env/kitchen/relay_policy_learning/adept_envs"
     ],

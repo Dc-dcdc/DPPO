@@ -11,13 +11,13 @@ device: "cuda:0"  # cuda或cpu
 
 hydra:
   run:
-    dir: outputs/finetune/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
+    dir: outputs/3_finetune/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.task}_${hydra.runtime.choices.policy}
     # dir: src/av-aloha/DPPO/outputs/pretrain/train/${now:%Y-%m-%d}/${now:%H-%M-%S}_${env.name}_${policy.name}_${hydra.job.name}
   job:
     name: ${env.task}_${hydra.runtime.choices.policy}_${now:%Y-%m-%d}_${now:%H-%M-%S}
 
 training:
-  pretrained_ckpt_path: "outputs/pretrain/train/.../checkpoints/050000"
+  pretrained_ckpt_path: "outputs/2_pretrain/train/.../checkpoints/050000"
   min_sampling_denoising_std: 0.02  # DDIM采样探索标准差；视觉机器人任务建议保持小而非0
   min_logprob_denoising_std: 0.02   # 与采样标准差保持一致，避免old/new logprob尺度不匹配
   logprob_reduction: sum            # PPO使用联合动作块logprob；mean会把梯度按8*21维稀释
